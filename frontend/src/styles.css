@@ -1,0 +1,779 @@
+/* ==========================================================================
+   Design tokens
+   Instrument-panel aesthetic: a deep navy control room reading live signals
+   off a fleet of repositories, not a generic SaaS dashboard. Risk levels map
+   to real signal colors, doing semantic work rather than decoration.
+   ========================================================================== */
+
+:root {
+  --bg: #0b1120;
+  --panel: #131b2e;
+  --panel-raised: #1a2438;
+  --border: #253049;
+  --text-primary: #e8ecf4;
+  --text-secondary: #8b96ad;
+  --text-tertiary: #5c6785;
+
+  --risk-critical: #e5484d;
+  --risk-high: #f5a623;
+  --risk-medium: #eab308;
+  --risk-healthy: #2dd4bf;
+
+  --risk-critical-bg: rgba(229, 72, 77, 0.12);
+  --risk-high-bg: rgba(245, 166, 35, 0.12);
+  --risk-medium-bg: rgba(234, 179, 8, 0.12);
+  --risk-healthy-bg: rgba(45, 212, 191, 0.12);
+
+  --font-ui: 'IBM Plex Sans', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'SF Mono', monospace;
+  /* Anthropic's own product serif (Tiempos) is a licensed commercial font
+     and can't be bundled here — Source Serif 4 is a comparable open
+     editorial serif standing in for it. If you have a license for the real
+     one, just swap the family name below. */
+  --font-serif: 'Source Serif 4', Georgia, serif;
+
+  --radius: 6px;
+}
+
+/* Light mode — a "daylight instrument panel" rather than a plain inverted
+   dark theme: risk colors are deepened slightly (not just reused as-is)
+   to keep proper contrast against a light background. */
+:root[data-theme='light'] {
+  --bg: #f4f6fb;
+  --panel: #ffffff;
+  --panel-raised: #eef1f8;
+  --border: #dde3f0;
+  --text-primary: #131b2e;
+  --text-secondary: #55607a;
+  --text-tertiary: #8b96ad;
+
+  --risk-critical: #c8353a;
+  --risk-high: #b8730f;
+  --risk-medium: #92650a;
+  --risk-healthy: #0f9488;
+
+  --risk-critical-bg: rgba(200, 53, 58, 0.08);
+  --risk-high-bg: rgba(184, 115, 15, 0.08);
+  --risk-medium-bg: rgba(146, 101, 10, 0.08);
+  --risk-healthy-bg: rgba(15, 148, 136, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+a {
+  color: inherit;
+}
+
+/* ==========================================================================
+   Layout
+   ========================================================================== */
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 32px 24px 80px;
+}
+
+.app-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 28px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.app-title {
+  font-family: var(--font-serif);
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.app-title .signal-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--risk-healthy);
+  box-shadow: 0 0 8px var(--risk-healthy);
+}
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.app-subtitle {
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+
+.theme-toggle {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  border-radius: var(--radius);
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+
+.theme-toggle:hover {
+  color: var(--text-primary);
+  border-color: var(--text-tertiary);
+}
+
+/* ==========================================================================
+   Summary strip — the "gauge cluster"
+   ========================================================================== */
+
+.summary-strip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  margin-bottom: 28px;
+}
+
+.gauge {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+  position: relative;
+  overflow: hidden;
+}
+
+.gauge::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: var(--gauge-color);
+}
+
+.gauge-count {
+  font-family: var(--font-mono);
+  font-size: 28px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--gauge-color);
+}
+
+.gauge-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ==========================================================================
+   Filter bar
+   ========================================================================== */
+
+.filter-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.filter-chip {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  border-radius: 100px;
+  padding: 6px 14px;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  transition: all 0.15s ease;
+}
+
+.filter-chip:hover {
+  border-color: var(--text-tertiary);
+  color: var(--text-primary);
+}
+
+.filter-chip.active {
+  background: var(--panel-raised);
+  border-color: var(--text-secondary);
+  color: var(--text-primary);
+}
+
+/* ==========================================================================
+   Repo table
+   ========================================================================== */
+
+.repo-table {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.repo-row {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) 90px minmax(0, 1.4fr) 90px;
+  align-items: center;
+  gap: 20px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.repo-row:last-child {
+  border-bottom: none;
+}
+
+.repo-row:hover {
+  background: var(--panel-raised);
+}
+
+.repo-row-header {
+  cursor: default;
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+
+.repo-row-header:hover {
+  background: transparent;
+}
+
+.repo-row-header .col-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+}
+
+.repo-name-cell {
+  min-width: 0;
+}
+
+.repo-name {
+  font-weight: 600;
+  font-size: 14px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.repo-owner {
+  color: var(--text-tertiary);
+  font-weight: 400;
+}
+
+.repo-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  margin-top: 3px;
+}
+
+.bus-factor-cell {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  font-weight: 600;
+  text-align: center;
+}
+
+/* ==========================================================================
+   Concentration bar — the signature element.
+   A literal, segmented visualization of who owns the commits: one giant
+   segment means one person could take the whole project down with them.
+   ========================================================================== */
+
+.concentration-bar {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.concentration-segment {
+  height: 100%;
+}
+
+.concentration-caption {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  margin-top: 5px;
+}
+
+/* ==========================================================================
+   Risk badge
+   ========================================================================== */
+
+.risk-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 100px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  justify-self: end;
+}
+
+.risk-badge .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+/* ==========================================================================
+   Detail view
+   ========================================================================== */
+
+.back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 0;
+  margin-bottom: 20px;
+}
+
+.back-link:hover {
+  color: var(--text-primary);
+}
+
+.detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 24px;
+}
+
+.detail-title {
+  font-family: var(--font-serif);
+  font-size: 26px;
+  font-weight: 600;
+  margin: 0 0 6px;
+}
+
+.detail-title .owner {
+  color: var(--text-tertiary);
+  font-weight: 400;
+}
+
+.detail-meta {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-secondary);
+  display: flex;
+  gap: 16px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin-bottom: 28px;
+}
+
+.stat-card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+
+.stat-value {
+  font-family: var(--font-mono);
+  font-size: 22px;
+  font-weight: 600;
+}
+
+.stat-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.section-title {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-tertiary);
+  margin: 0 0 12px;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 24px;
+}
+
+.contributor-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) 100px 60px;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.contributor-row:last-child {
+  border-bottom: none;
+}
+
+.contributor-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.contributor-commits {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: right;
+}
+
+.contributor-pct {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  text-align: right;
+  color: var(--text-tertiary);
+}
+
+/* ==========================================================================
+   States
+   ========================================================================== */
+
+.state-message {
+  text-align: center;
+  padding: 60px 20px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+
+.state-message.error {
+  color: var(--risk-critical);
+}
+
+/* ==========================================================================
+   Toolbar: search + add repo
+   ========================================================================== */
+
+.toolbar {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.search-bar {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0 12px;
+}
+
+.search-icon {
+  color: var(--text-tertiary);
+  flex-shrink: 0;
+}
+
+.search-input {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 9px 0;
+}
+
+.search-input::placeholder {
+  color: var(--text-tertiary);
+}
+
+.search-clear {
+  background: none;
+  border: none;
+  color: var(--text-tertiary);
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.search-clear:hover {
+  color: var(--text-primary);
+}
+
+.add-repo-btn {
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: var(--radius);
+  padding: 0 16px;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+
+.add-repo-btn:hover {
+  border-color: var(--text-secondary);
+}
+
+/* ==========================================================================
+   Row remove button (in the repo table)
+   ========================================================================== */
+
+.repo-row-end {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  justify-self: end;
+}
+
+.row-remove-btn {
+  background: none;
+  border: none;
+  color: var(--text-tertiary);
+  font-size: 18px;
+  line-height: 1;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: all 0.12s ease;
+}
+
+.repo-row:hover .row-remove-btn {
+  opacity: 1;
+}
+
+.row-remove-btn:hover {
+  color: var(--risk-critical);
+  background: var(--risk-critical-bg);
+}
+
+/* ==========================================================================
+   Add-repo modal
+   ========================================================================== */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+  z-index: 100;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: 100%;
+  max-width: 480px;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  padding: 20px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+}
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 14px;
+}
+
+.modal-title {
+  font-family: var(--font-serif);
+  font-size: 18px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--text-tertiary);
+  font-size: 22px;
+  line-height: 1;
+}
+
+.modal-close:hover {
+  color: var(--text-primary);
+}
+
+.modal-search-input {
+  width: 100%;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  padding: 10px 12px;
+  outline: none;
+  margin-bottom: 12px;
+}
+
+.modal-search-input:focus {
+  border-color: var(--text-secondary);
+}
+
+.modal-status {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  padding: 6px 0;
+}
+
+.modal-status.error {
+  color: var(--risk-critical);
+}
+
+.suggestion-list {
+  overflow-y: auto;
+}
+
+.suggestion-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.suggestion-row:last-child {
+  border-bottom: none;
+}
+
+.suggestion-info {
+  min-width: 0;
+}
+
+.suggestion-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.suggestion-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.suggestion-meta {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  font-family: var(--font-mono);
+  margin-top: 3px;
+}
+
+.suggestion-add-btn {
+  flex-shrink: 0;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+
+.suggestion-add-btn:hover:not(:disabled) {
+  border-color: var(--text-secondary);
+}
+
+.suggestion-add-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ==========================================================================
+   Responsive
+   ========================================================================== */
+
+@media (max-width: 640px) {
+  .summary-strip {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .repo-row {
+    grid-template-columns: minmax(0, 1fr) 60px;
+  }
+  .repo-row .concentration-col,
+  .repo-row-header .col-label:nth-child(3) {
+    display: none;
+  }
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Respect reduced motion preference */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
+}

@@ -1,0 +1,272 @@
+# Bus Factor Tracker — MySQL Starter (Phase 1/2)
+
+MySQL version of the project skeleton: schema + a sync script that pulls
+real GitHub data and computes bus factor.
+
+## Setup
+
+1. **Install MySQL** locally (MySQL 8.0+ required — window functions and CTEs
+   need 8.0, they don't exist in 5.7). Check your version:
+   ```
+   mysql --version
+   ```
+
+2. **Create the database:**
+   ```sql
+   CREATE DATABASE bus_factor_tracker;
+   ```
+
+3. **Load the schema:**
+   ```
+   mysql -u root -p bus_factor_tracker < sql/schema_mysql.sql
+   ```
+
+4. **Get a GitHub personal access token:**
+   GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens.
+   Read-only, public repositories is enough — no special scopes needed.
+
+5. **Install Python deps:**
+   ```
+   pip install -r requirements_mysql.txt
+   ```
+
+6. **Configure environment:**
+   ```
+   cp .env.example .env
+   ```
+   Edit `.env` — fill in `GITHUB_TOKEN`, and check `DB_USER`/`DB_PASSWORD` match
+   your local MySQL setup (default port 3306).
+
+7. **Edit `repos.txt`** — add/remove repos you want to track. Start with 5–10
+   to confirm everything works before scaling up to 50–100.
+
+8. **Run the sync:**
+   ```
+   python scripts/sync_mysql.py
+   ```
+
+   Expected output:
+   ```
+   Syncing facebook/react...
+       -> bus_factor=6  risk=Healthy  top_contributor=18.2%
+     done.
+   Syncing sindresorhus/is-online...
+       -> bus_factor=1  risk=Critical  top_contributor=91.4%
+     done.
+   ```
+
+9. **Check the data:**
+   ```sql
+   SELECT r.owner, r.name, s.bus_factor, s.risk_level, s.top_contributor_pct
+   FROM bus_factor_snapshot s
+   JOIN repository r ON r.repo_id = s.repo_id
+   ORDER BY s.computed_at DESC;
+   ```
+
+## Notes on MySQL-specific differences from the original guide
+
+- **`release` → `repo_release`**: `RELEASE` is a reserved word in MySQL
+  (used in `RELEASE SAVEPOINT`), so that table is renamed to avoid needing
+  backticks everywhere.
+- **Upserts**: MySQL uses `INSERT ... ON DUPLICATE KEY UPDATE` instead of
+  Postgres's `INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING`. MySQL's
+  version doesn't return the id directly, so the script does a follow-up
+  `SELECT` to fetch it — see `upsert_repo()` / `upsert_contributor()` in
+  `sync_mysql.py`.
+- **Window functions & CTEs**: identical syntax to Postgres, but only from
+  **MySQL 8.0 onward** — this matters if your college lab machines run an
+  older MySQL 5.7 install. Check with `mysql --version` before you rely on
+  the window-function queries.
+- **`INTERVAL` syntax**: MySQL writes `INTERVAL 6 MONTH` (no quotes, unit
+  after the number); Postgres writes `INTERVAL '6 months'`. See
+  `sql/queries_mysql.sql`.
+- **`PERCENTILE_CONT`**: only available from MySQL 8.0.28 onward. An older
+  fallback using `ROW_NUMBER()` is included in `sql/queries_mysql.sql` in
+  case your MySQL version predates it.
+
+## Phase 3 additions (already in `sync_mysql.py`)
+
+- **Issues, pull requests, and releases** are now pulled per repo (capped at
+  ~300 most-recent items per endpoint via pagination, so one huge repo can't
+  blow your rate limit or make the run take forever).
+- **`median_issue_response_hours`** is computed from the first comment on the
+  30 most-recently-updated issues per repo (each costs one extra API call —
+  that's why it's capped, not run against every issue).
+- **`weekly_activity`** is now populated from GitHub's commit-activity stats
+  endpoint, ready for trend-style queries later.
+- **Risk scoring got a second signal**: if the median issue response time is
+  over a month, risk level gets bumped up one notch even if bus factor alone
+  looked okay — a repo can have several contributors but still be effectively
+  unmaintained if nobody's answering issues.
+- Everything for a repo — metadata, contributors, issues, PRs, releases,
+  snapshot — is still wrapped in **one transaction per repo**. If anything
+  fails partway through, the whole repo's sync rolls back cleanly rather than
+  leaving partial data.
+
+**Rate limit note:** with issues/PRs/releases added, each repo now costs
+roughly 5–10 API calls instead of 2. At ~35 repos in the curated `repos.txt`,
+that's comfortably inside your 5,000/hour quota, but if you expand well past
+50–100 repos, watch your usage (`X-RateLimit-Remaining` response header).
+
+## Phase 5: FastAPI backend
+
+The backend only reads from MySQL — it never talks to GitHub. That's why
+every endpoint responds in milliseconds, unlike the sync script which takes
+10-15s per repo. See the note earlier in this README about why these are
+deliberately separate pieces.
+
+### Setup
+
+```
+cd backend
+pip install -r requirements.txt
+```
+
+The backend reads the same `.env` file as the sync script (`DB_HOST`,
+`DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`) — copy it into the `backend/`
+folder, or point `python-dotenv` at the project root's `.env`.
+
+### Run
+
+```
+cd backend
+uvicorn main:app --reload --port 8000
+```
+
+Visit **http://localhost:8000/docs** for interactive API documentation
+(auto-generated by FastAPI from the route definitions — no extra work needed).
+
+### Endpoints
+
+| Endpoint | What it returns |
+|---|---|
+| `GET /api/repos` | Risk-ranked list of all tracked repos with their latest snapshot. Supports `?risk=Critical` filtering and `?sort=risk\|stars\|name`. |
+| `GET /api/repos/{owner}/{name}` | Full detail for one repo: metadata, latest snapshot, contributor breakdown. |
+| `GET /api/repos/{owner}/{name}/trend` | Full snapshot history for one repo — powers a bus-factor-over-time chart. Only meaningful after `sync_mysql.py` has run more than once. |
+| `GET /api/stats/summary` | Dashboard header counts: how many repos are Critical/High/Medium/Healthy. |
+
+Tested end-to-end against a real MySQL 8.0 instance with synthetic data
+(including the "latest snapshot per repo" join, risk filtering/sorting, and
+multi-snapshot trend data) before being handed off — not just syntax-checked.
+
+## Phase 6: React frontend
+
+Instrument-panel design: deep navy background, risk levels mapped to real
+signal colors (critical/high/medium/healthy), IBM Plex Mono for all data so
+usernames/commit counts/timestamps read cleanly. The signature visual is the
+**concentration bar** — a literal segmented bar showing each contributor's
+share of commits, so bus factor is visible at a glance, not just a number.
+
+### Setup
+
+```
+cd frontend
+npm install
+```
+
+### Run
+
+```
+npm run dev
+```
+
+Visit **http://localhost:5173**. The frontend expects the backend running on
+`http://localhost:8000` (see `src/api.js` if you need to change that).
+
+### What's in it
+
+- **Dashboard view** — gauge cluster (Critical/High/Medium/Healthy counts),
+  risk filter chips, and a sortable repo table with the concentration bar
+  per row.
+- **Detail view** — click any repo to see its full stat breakdown, a bus-
+  factor-over-time trend chart (recharts — only renders once a repo has 2+
+  snapshots), the full concentration bar, and a contributor table.
+
+### What's in it
+
+- **Dashboard view** — gauge cluster (Critical/High/Medium/Healthy counts),
+  a search bar to filter tracked repos by name, risk filter chips, and a
+  sortable repo table with the concentration bar per row.
+- **Detail view** — click any repo to see its full stat breakdown, a bus-
+  factor-over-time trend chart (recharts — only renders once a repo has 2+
+  snapshots), the full concentration bar, and a contributor table.
+- **Dark / light mode** — toggle in the header, persisted across visits.
+  Light mode isn't just dark-mode-inverted — risk colors are deepened
+  slightly to keep proper contrast against a white background.
+- **Add repo** — click "+ Add repo", search GitHub directly (debounced
+  autocomplete), click a result to add and sync it. This calls the exact
+  same `sync_repo()` function the batch script uses, so takes the same
+  10-15 seconds one repo takes during a normal sync — the UI shows a
+  "Syncing…" state, not a spinner that lies about how fast this is.
+- **Remove repo** — hover a row to reveal a × button; removing a repo
+  deletes its full history too (cascading delete via the schema's foreign
+  keys) and updates `repos.txt` to match, so a later batch sync run won't
+  try to re-add it.
+- **Serif headings** — Anthropic's actual product serif (Tiempos) is a
+  licensed commercial font that can't be bundled here; Source Serif 4
+  stands in for it in headings. Swap the `--font-serif` variable in
+  `styles.css` if you have a license for the real one.
+
+### Backend requirement for Add Repo / search
+
+`GITHUB_TOKEN` now needs to be set in `backend/.env` (or the project root's
+`.env`, which the backend also reads) for the search and add-repo features
+to work. Without it, the rest of the dashboard still works fine — only
+those two features degrade gracefully with a clear error instead of
+crashing anything.
+
+### Verified
+
+Production build (`npm run build`) succeeds with no errors. Every endpoint
+was tested against a live backend + seeded MySQL database (3 repos across
+Critical/Medium risk levels) and returned correctly-shaped data end-to-end.
+A visual screenshot could not be captured in this environment (no headless
+Chrome available) — worth eyeballing the actual rendered layout yourself
+once you run it.
+
+## What's next (Phase 7)
+
+- Polish pass: error states, loading skeletons, mobile testing.
+- Write up the ER diagram / normalization / transaction discussion for your
+  report using Sections 5, 7, and this README as source material.
+- Prepare your demo using the three-repo proof described in the original
+  project guide (a healthy repo, a critical one, and a visible trend
+  decline).
+
+## Files
+
+```
+bus-factor-tracker/
+├── sql/
+│   ├── schema_mysql.sql        # run this first
+│   └── queries_mysql.sql       # bus factor + trend + median queries
+├── scripts/
+│   └── sync_mysql.py           # the sync/ingest script
+├── backend/
+│   ├── main.py                 # FastAPI app — the API endpoints
+│   ├── db.py                   # MySQL connection pool
+│   └── requirements.txt        # backend-only dependencies
+├── frontend/
+│   ├── package.json
+│   ├── vite.config.js
+│   ├── index.html
+│   └── src/
+│       ├── main.jsx            # entry point
+│       ├── App.jsx             # top-level view switching (dashboard/detail)
+│       ├── api.js              # fetch wrapper for the FastAPI backend
+│       ├── styles.css          # design tokens + all styling
+│       └── components/
+│           ├── SummaryBar.jsx        # gauge cluster
+│           ├── RepoTable.jsx         # risk-ranked table + filter chips + remove
+│           ├── RepoDetail.jsx        # detail view + trend chart
+│           ├── ConcentrationBar.jsx  # the signature visual
+│           ├── RiskBadge.jsx         # risk level pill
+│           ├── SearchBar.jsx         # filter tracked repos by name
+│           ├── ThemeToggle.jsx       # dark/light mode switch
+│           └── AddRepoModal.jsx      # GitHub search + add repo
+├── repos.txt                   # list of repos to track — edit this
+├── requirements_mysql.txt      # sync script dependencies
+├── .env.example                # copy to .env and fill in
+└── README_mysql.md
+```
+

@@ -1,0 +1,61 @@
+# Curated repo list for Bus Factor Tracker
+# Mix of large/well-staffed, small/single-maintainer, and likely-fragile or
+# inactive projects, so your risk scoring has real variety to differentiate.
+# The sync script pulls live data, so exact status (archived, active, etc.)
+# is determined at sync time, not by this comment.
+#
+# Feel free to trim this down while testing (start with ~10), then run the
+# full list once the pipeline is confirmed working end-to-end.
+
+# --- Large, well-staffed / foundation-backed (expect healthy bus factor) ---
+facebook/react
+angular/angular
+vuejs/core
+django/django
+pallets/flask
+kubernetes/kubernetes
+microsoft/vscode
+tensorflow/tensorflow
+pytorch/pytorch
+rust-lang/rust
+nodejs/node
+golang/go
+python/cpython
+rails/rails
+laravel/laravel
+
+# --- Small, high-usage, single/few-maintainer utility libraries ---
+# (the "next left-pad" risk zone — expect low bus factor)
+sindresorhus/is-online
+sindresorhus/ky
+chalk/chalk
+sindresorhus/execa
+jonschlinkert/is-number
+sindresorhus/p-limit
+substack/node-mkdirp
+tj/commander.js
+motdotla/dotenv
+lodash/lodash
+
+# --- Historically important but reduced-activity / maintenance-mode ---
+# (good mid-range bus factor / declining-trend candidates)
+moment/moment
+request/request
+mochajs/mocha
+gulpjs/gulp
+jashkenas/underscore
+jquery/jquery
+
+# --- Python ecosystem, mixed maintenance levels ---
+psf/requests
+pypa/pip
+benoitc/gunicorn
+encode/httpx
+
+# --- Smaller / niche, worth checking archived status live ---
+jquery/jquery-mobile
+caolan/async
+Automattic/mongoose
+expressjs/express
+
+cordiverse/cordis
