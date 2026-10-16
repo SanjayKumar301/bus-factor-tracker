@@ -31,22 +31,52 @@ GROUP BY repo_id;
 
 
 -- ============================================================
--- Query 2: Repos trending toward risk (activity decline over time)
+-- Query 2: Repos trending toward risk (bus factor declined over time)
 -- ============================================================
-SELECT r.name, s1.bus_factor AS bus_factor_now, s2.bus_factor AS bus_factor_6mo_ago
-FROM bus_factor_snapshot s1
-JOIN bus_factor_snapshot s2
-  ON s1.repo_id = s2.repo_id
-  AND s2.computed_at = s1.computed_at - INTERVAL 6 MONTH
-JOIN repository r ON r.repo_id = s1.repo_id
-WHERE s1.bus_factor < s2.bus_factor
-ORDER BY (s2.bus_factor - s1.bus_factor) DESC;
+-- Compares each repo's LATEST snapshot against the most recent snapshot
+-- taken at least 6 months before it.
+--
+-- Why not `s2.computed_at = s1.computed_at - INTERVAL 6 MONTH`? Snapshots
+-- are taken whenever the sync runs, so two of them are essentially never
+-- exactly 6 months apart to the second — an equality join returns nothing.
+-- Instead, pick the newest snapshot that is *at least* 6 months older.
+WITH latest AS (
+  SELECT repo_id, MAX(computed_at) AS latest_at
+  FROM bus_factor_snapshot
+  GROUP BY repo_id
+),
+paired AS (
+  SELECT
+    l.repo_id,
+    l.latest_at,
+    (SELECT MAX(s.computed_at)
+       FROM bus_factor_snapshot s
+      WHERE s.repo_id = l.repo_id
+        AND s.computed_at <= l.latest_at - INTERVAL 6 MONTH) AS baseline_at
+  FROM latest l
+)
+SELECT
+  r.owner,
+  r.name,
+  now_s.bus_factor  AS bus_factor_now,
+  then_s.bus_factor AS bus_factor_6mo_ago,
+  then_s.risk_level AS risk_then,
+  now_s.risk_level  AS risk_now
+FROM paired p
+JOIN bus_factor_snapshot now_s  ON now_s.repo_id  = p.repo_id AND now_s.computed_at  = p.latest_at
+JOIN bus_factor_snapshot then_s ON then_s.repo_id = p.repo_id AND then_s.computed_at = p.baseline_at
+JOIN repository r ON r.repo_id = p.repo_id
+WHERE now_s.bus_factor < then_s.bus_factor
+ORDER BY (then_s.bus_factor - now_s.bus_factor) DESC;
 
 -- Difference from Postgres: MySQL's interval syntax is
 --   `computed_at - INTERVAL 6 MONTH`
 -- instead of Postgres's
 --   `computed_at - INTERVAL '6 months'`
 -- (no quotes, unit comes after the number, singular unit name).
+--
+-- The same logic, with the look-back window as a parameter, is available as
+-- the stored procedure sp_declining_repos(days) in sql/objects_mysql.sql.
 
 
 -- ============================================================

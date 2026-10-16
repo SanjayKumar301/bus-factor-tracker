@@ -79,6 +79,15 @@ bus-factor-tracker/
 
 ```sql
 source sql/schema_mysql.sql
+source sql/objects_mysql.sql   -- view, stored function/procedure, trigger
+```
+
+Already have a database from an older schema? Run the migration once instead
+of the schema file, then the objects file:
+
+```sql
+source sql/migrate_001_burnout_signals.sql
+source sql/objects_mysql.sql
 ```
 
 ### 3. Environment Variables
@@ -104,6 +113,14 @@ pip install -r requirements_mysql.txt
 python scripts/sync_mysql.py
 ```
 
+Each run adds one snapshot per repo, which is what the trend chart and
+`sp_declining_repos` compare. To run it daily on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\register_sync_task.ps1   # registers a 09:00 daily task
+powershell -ExecutionPolicy Bypass -File scripts\run_sync.ps1             # one run now, logged to logs\sync.log
+```
+
 ### 6. Frontend
 
 ```bash
@@ -117,12 +134,26 @@ npm run dev
 
 ## Risk Scoring
 
+The base level comes from the bus factor:
+
 | Risk Level | Criteria |
 |---|---|
-| 🔴 Critical | Bus factor = 1 |
+| 🔴 Critical | Bus factor = 1, or the repo is archived |
 | 🟠 High | Bus factor = 2 |
 | 🟡 Medium | Bus factor 3–4 |
 | 🟢 Healthy | Bus factor 5+ |
+
+Each burnout warning sign then raises it one level (capped at Critical):
+
+| Signal | Threshold |
+|---|---|
+| Slow issue responses | median first reply > 30 days |
+| Commit activity decline | last 12 weeks ≥ 50% below the 40 weeks before |
+| Top contributor gone quiet | no commit in > 180 days, if they wrote ≥ 25% of commits |
+
+Days since the last release is shown but doesn't change the level. The
+repo page lists the exact reasons behind each score; the thresholds live in
+`assess_risk()` in `scripts/sync_mysql.py`.
 
 ---
 
@@ -134,6 +165,8 @@ npm run dev
 | `GET` | `/api/repos/{owner}/{name}` | Repo detail + contributor breakdown |
 | `GET` | `/api/repos/{owner}/{name}/trend` | Bus factor history |
 | `GET` | `/api/stats/summary` | Dashboard aggregate counts |
+| `GET` | `/api/stats/declining?days=180` | Repos whose bus factor or risk worsened (`sp_declining_repos`) |
+| `GET` | `/api/alerts` | Recent risk increases (written by `trg_snapshot_risk_alert`) |
 | `GET` | `/api/github/search?q=...` | Search GitHub repos |
 | `POST` | `/api/repos` | Add a repo to track |
 | `DELETE` | `/api/repos/{owner}/{name}` | Remove a repo |

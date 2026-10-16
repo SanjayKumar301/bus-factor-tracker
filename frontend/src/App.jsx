@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
-import { fetchRepos, fetchSummary, removeRepo } from './api.js'
+import { fetchAlerts, fetchRepos, fetchSummary, removeRepo } from './api.js'
 import SummaryBar from './components/SummaryBar.jsx'
 import RepoTable from './components/RepoTable.jsx'
 import RepoDetail from './components/RepoDetail.jsx'
 import SearchBar from './components/SearchBar.jsx'
 import ThemeToggle from './components/ThemeToggle.jsx'
 import AddRepoModal from './components/AddRepoModal.jsx'
+import AlertsPanel from './components/AlertsPanel.jsx'
 
 function getInitialTheme() {
   const saved = localStorage.getItem('bft-theme')
@@ -17,6 +18,7 @@ function getInitialTheme() {
 export default function App() {
   const [repos, setRepos] = useState(null)
   const [summary, setSummary] = useState(null)
+  const [alerts, setAlerts] = useState(null)
   const [filter, setFilter] = useState('All')
   const [search, setSearch] = useState('')
   const [error, setError] = useState(null)
@@ -31,6 +33,7 @@ export default function App() {
 
   function reload() {
     fetchSummary().then(setSummary).catch((e) => setError(e.message))
+    fetchAlerts().then(setAlerts).catch(() => setAlerts([]))
     fetchRepos({ risk: filter === 'All' ? undefined : filter, sort: 'risk' })
       .then(setRepos)
       .catch((e) => setError(e.message))
@@ -38,6 +41,9 @@ export default function App() {
 
   useEffect(() => {
     fetchSummary().then(setSummary).catch((e) => setError(e.message))
+    // Alerts are a nice-to-have panel — if the endpoint fails (e.g. the
+    // risk_alert migration hasn't been run yet), just hide the panel.
+    fetchAlerts().then(setAlerts).catch(() => setAlerts([]))
   }, [])
 
   useEffect(() => {
@@ -94,6 +100,8 @@ export default function App() {
       {!error && !selectedRepo && (
         <>
           <SummaryBar summary={summary} />
+
+          <AlertsPanel alerts={alerts} onSelectRepo={setSelectedRepo} />
 
           <div className="toolbar">
             <SearchBar value={search} onChange={setSearch} />

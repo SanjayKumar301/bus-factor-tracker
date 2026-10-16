@@ -1,6 +1,7 @@
 -- Bus Factor Tracker — MySQL Schema
 -- Run this once against a fresh database:
---   mysql -u root -p bus_factor_tracker < schema.sql
+--   mysql -u root -p bus_factor_tracker < sql/schema_mysql.sql
+--   mysql -u root -p bus_factor_tracker < sql/objects_mysql.sql
 --
 -- (create the database first:  CREATE DATABASE bus_factor_tracker;)
 
@@ -87,11 +88,33 @@ CREATE TABLE bus_factor_snapshot (
     top_contributor_pct          FLOAT,
     active_contributor_count     INT,
     median_issue_response_hours  FLOAT,
+    -- burnout signals (see compute_and_insert_snapshot in sync_mysql.py)
+    activity_change_pct            FLOAT,   -- avg weekly commits, last 12 weeks vs the 40 before (%)
+    top_contributor_days_inactive  INT,     -- days since the top contributor's last commit
+    days_since_last_release        INT,
     risk_level                   ENUM('Critical', 'High', 'Medium', 'Healthy'),
     FOREIGN KEY (repo_id) REFERENCES repository(repo_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- One row per time a repo's risk level got WORSE between consecutive
+-- snapshots. Written only by the trg_snapshot_risk_alert trigger
+-- (sql/objects_mysql.sql).
+CREATE TABLE risk_alert (
+    alert_id        INT AUTO_INCREMENT PRIMARY KEY,
+    repo_id         INT NOT NULL,
+    snapshot_id     INT NOT NULL,
+    previous_level  ENUM('Critical', 'High', 'Medium', 'Healthy') NOT NULL,
+    new_level       ENUM('Critical', 'High', 'Medium', 'Healthy') NOT NULL,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (repo_id) REFERENCES repository(repo_id) ON DELETE CASCADE,
+    FOREIGN KEY (snapshot_id) REFERENCES bus_factor_snapshot(snapshot_id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
 -- Helpful indexes for the analytical queries in the project guide
 CREATE INDEX idx_repo_contributor_repo ON repo_contributor(repo_id);
 CREATE INDEX idx_issue_repo ON issue(repo_id);
 CREATE INDEX idx_snapshot_repo_time ON bus_factor_snapshot(repo_id, computed_at);
+CREATE INDEX idx_risk_alert_time ON risk_alert(created_at);
+
+-- Views, the stored function/procedure and the trigger live in
+-- sql/objects_mysql.sql — run that file after this one.

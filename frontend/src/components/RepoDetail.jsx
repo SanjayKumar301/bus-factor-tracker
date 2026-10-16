@@ -99,6 +99,43 @@ export default function RepoDetail({ repoRef, onBack }) {
         </div>
       </div>
 
+      <div className="panel" style={{ '--driver-color': lineColor }}>
+        <h2 className="section-title">Why {detail.risk_level || 'this'} risk</h2>
+        {detail.risk_drivers.length > 0 ? (
+          <ul className="driver-list">
+            {detail.risk_drivers.map((d) => (
+              <li key={d}>{d}</li>
+            ))}
+          </ul>
+        ) : (
+          <div className="state-message">No snapshot yet — run the sync script for this repo.</div>
+        )}
+      </div>
+
+      <h2 className="section-title">Burnout signals</h2>
+      <div className="detail-grid">
+        <div className="stat-card">
+          <div className={`stat-value${detail.activity_change_pct != null && detail.activity_change_pct <= -50 ? ' warn' : ''}`}>
+            {detail.activity_change_pct != null
+              ? `${detail.activity_change_pct > 0 ? '+' : ''}${Math.round(detail.activity_change_pct)}%`
+              : 'n/a'}
+          </div>
+          <div className="stat-label">Commit activity, last 12 wks</div>
+        </div>
+        <div className="stat-card">
+          <div className={`stat-value${detail.top_contributor_days_inactive > 180 ? ' warn' : ''}`}>
+            {detail.top_contributor_days_inactive != null ? `${detail.top_contributor_days_inactive}d` : 'n/a'}
+          </div>
+          <div className="stat-label">Since top contributor's last commit</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-value">
+            {detail.days_since_last_release != null ? `${detail.days_since_last_release}d` : 'n/a'}
+          </div>
+          <div className="stat-label">Since last release</div>
+        </div>
+      </div>
+
       {trend && trend.length > 1 && (
         <div className="panel">
           <h2 className="section-title">Bus factor over time</h2>

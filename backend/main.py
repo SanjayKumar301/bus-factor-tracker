@@ -48,7 +48,7 @@ REPOS_FILE = Path(__file__).parent.parent / "repos.txt"
 # gets synced, whether that's triggered by the batch script or by a user
 # clicking "add" in the UI.
 sys.path.append(str(Path(__file__).parent.parent / "scripts"))
-from sync_mysql import sync_repo  # noqa: E402
+from sync_mysql import sync_repo, assess_risk  # noqa: E402
 
 app = FastAPI(
     title="Bus Factor Tracker API",
@@ -85,6 +85,9 @@ class RepoSummary(BaseModel):
     top_contributor_pct: Optional[float]
     active_contributor_count: Optional[int]
     median_issue_response_hours: Optional[float]
+    activity_change_pct: Optional[float]
+    top_contributor_days_inactive: Optional[int]
+    days_since_last_release: Optional[int]
     risk_level: Optional[str]
     computed_at: Optional[str]
 
@@ -114,7 +117,28 @@ class ContributorBreakdown(BaseModel):
 class RepoDetail(RepoSummary):
     forks: int
     created_at: Optional[str]
+    risk_drivers: list[str]
     contributors: list[ContributorBreakdown]
+
+
+class DecliningRepo(BaseModel):
+    owner: str
+    name: str
+    then_at: str
+    now_at: str
+    bus_factor_then: int
+    bus_factor_now: int
+    risk_then: str
+    risk_now: str
+
+
+class RiskAlert(BaseModel):
+    alert_id: int
+    owner: str
+    name: str
+    previous_level: str
+    new_level: str
+    created_at: str
 
 
 class SnapshotPoint(BaseModel):
@@ -133,22 +157,34 @@ class DashboardSummary(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Shared query fragment: repo + its MOST RECENT snapshot.
-# Uses a correlated subquery to grab each repo's latest computed_at — the
-# straightforward way to do "latest row per group" without window functions
-# cluttering every endpoint that needs this same join.
+# Every "repo + its latest snapshot" read goes through the v_repo_latest_snapshot
+# view (sql/objects_mysql.sql), so the latest-row-per-group logic lives in the
+# database once instead of being repeated in each endpoint.
 # ---------------------------------------------------------------------------
 
-LATEST_SNAPSHOT_JOIN = """
-    FROM repository r
-    LEFT JOIN bus_factor_snapshot s
-        ON s.repo_id = r.repo_id
-        AND s.computed_at = (
-            SELECT MAX(s2.computed_at)
-            FROM bus_factor_snapshot s2
-            WHERE s2.repo_id = r.repo_id
-        )
+SUMMARY_COLUMNS = """
+    repo_id, owner, name, primary_language, stars, is_archived,
+    bus_factor, top_contributor_pct, active_contributor_count,
+    median_issue_response_hours, activity_change_pct,
+    top_contributor_days_inactive, days_since_last_release,
+    risk_level, computed_at
 """
+
+FLOAT_FIELDS = ("top_contributor_pct", "median_issue_response_hours", "activity_change_pct")
+DATE_FIELDS = ("computed_at", "created_at", "then_at", "now_at")
+
+
+def to_json_types(row):
+    """Convert datetime / Decimal values from MySQL into plain JSON types."""
+    for key in DATE_FIELDS:
+        if row.get(key) is not None:
+            row[key] = row[key].isoformat()
+    for key in FLOAT_FIELDS:
+        if row.get(key) is not None:
+            row[key] = float(row[key])
+    if "is_archived" in row:
+        row["is_archived"] = bool(row["is_archived"])
+    return row
 
 
 @app.get("/api/repos", response_model=list[RepoSummary])
@@ -166,22 +202,21 @@ def list_repos(
     where_clause = ""
     params = []
     if risk:
-        where_clause = "WHERE s.risk_level = %s"
+        where_clause = "WHERE risk_level = %s"
         params.append(risk)
 
+    # fn_risk_rank() is the stored function from sql/objects_mysql.sql
+    # (Healthy = 1 ... Critical = 4); repos with no snapshot yet sort last.
     order_clause = {
-        "risk": "FIELD(s.risk_level, 'Critical', 'High', 'Medium', 'Healthy'), s.bus_factor ASC",
-        "stars": "r.stars DESC",
-        "name": "r.owner ASC, r.name ASC",
-    }.get(sort, "FIELD(s.risk_level, 'Critical', 'High', 'Medium', 'Healthy')")
+        "risk": "fn_risk_rank(risk_level) DESC, bus_factor ASC",
+        "stars": "stars DESC",
+        "name": "owner ASC, name ASC",
+    }.get(sort, "fn_risk_rank(risk_level) DESC, bus_factor ASC")
 
     cur.execute(
         f"""
-        SELECT
-            r.repo_id, r.owner, r.name, r.primary_language, r.stars, r.is_archived,
-            s.bus_factor, s.top_contributor_pct, s.active_contributor_count,
-            s.median_issue_response_hours, s.risk_level, s.computed_at
-        {LATEST_SNAPSHOT_JOIN}
+        SELECT {SUMMARY_COLUMNS}
+        FROM v_repo_latest_snapshot
         {where_clause}
         ORDER BY {order_clause}
         """,
@@ -190,16 +225,7 @@ def list_repos(
     rows = cur.fetchall()
     cur.close()
 
-    # Convert non-JSON-serializable types (datetime, Decimal) to plain types.
-    for row in rows:
-        if row["computed_at"] is not None:
-            row["computed_at"] = row["computed_at"].isoformat()
-        if row["top_contributor_pct"] is not None:
-            row["top_contributor_pct"] = float(row["top_contributor_pct"])
-        if row["median_issue_response_hours"] is not None:
-            row["median_issue_response_hours"] = float(row["median_issue_response_hours"])
-
-    return rows
+    return [to_json_types(row) for row in rows]
 
 
 @app.get("/api/repos/{owner}/{name}", response_model=RepoDetail)
@@ -212,13 +238,9 @@ def get_repo_detail(owner: str, name: str, conn: MySQLConnection = Depends(get_c
 
     cur.execute(
         f"""
-        SELECT
-            r.repo_id, r.owner, r.name, r.primary_language, r.stars, r.forks,
-            r.created_at, r.is_archived,
-            s.bus_factor, s.top_contributor_pct, s.active_contributor_count,
-            s.median_issue_response_hours, s.risk_level, s.computed_at
-        {LATEST_SNAPSHOT_JOIN}
-        WHERE r.owner = %s AND r.name = %s
+        SELECT {SUMMARY_COLUMNS}, forks, created_at
+        FROM v_repo_latest_snapshot
+        WHERE owner = %s AND name = %s
         """,
         (owner, name),
     )
@@ -250,14 +272,21 @@ def get_repo_detail(owner: str, name: str, conn: MySQLConnection = Depends(get_c
     for c in contributors:
         c["commit_share_pct"] = float(c["commit_share_pct"]) if c["commit_share_pct"] is not None else 0.0
 
-    if repo["computed_at"] is not None:
-        repo["computed_at"] = repo["computed_at"].isoformat()
-    if repo["created_at"] is not None:
-        repo["created_at"] = repo["created_at"].isoformat()
-    if repo["top_contributor_pct"] is not None:
-        repo["top_contributor_pct"] = float(repo["top_contributor_pct"])
-    if repo["median_issue_response_hours"] is not None:
-        repo["median_issue_response_hours"] = float(repo["median_issue_response_hours"])
+    to_json_types(repo)
+
+    # Same function (and thresholds) the sync used to pick risk_level, so
+    # the explanation always matches the stored score.
+    repo["risk_drivers"] = []
+    if repo["bus_factor"] is not None:
+        _, repo["risk_drivers"] = assess_risk(
+            bus_factor=repo["bus_factor"],
+            top_contributor_pct=repo["top_contributor_pct"],
+            median_issue_response_hours=repo["median_issue_response_hours"],
+            activity_change_pct=repo["activity_change_pct"],
+            top_contributor_days_inactive=repo["top_contributor_days_inactive"],
+            days_since_last_release=repo["days_since_last_release"],
+            is_archived=repo["is_archived"],
+        )
 
     repo["contributors"] = contributors
     return repo
@@ -303,14 +332,14 @@ def get_dashboard_summary(conn: MySQLConnection = Depends(get_connection)):
     """
     cur = conn.cursor(dictionary=True)
     cur.execute(
-        f"""
+        """
         SELECT
             COUNT(*) AS total_repos_tracked,
-            SUM(CASE WHEN s.risk_level = 'Critical' THEN 1 ELSE 0 END) AS critical_count,
-            SUM(CASE WHEN s.risk_level = 'High' THEN 1 ELSE 0 END) AS high_count,
-            SUM(CASE WHEN s.risk_level = 'Medium' THEN 1 ELSE 0 END) AS medium_count,
-            SUM(CASE WHEN s.risk_level = 'Healthy' THEN 1 ELSE 0 END) AS healthy_count
-        {LATEST_SNAPSHOT_JOIN}
+            SUM(CASE WHEN risk_level = 'Critical' THEN 1 ELSE 0 END) AS critical_count,
+            SUM(CASE WHEN risk_level = 'High' THEN 1 ELSE 0 END) AS high_count,
+            SUM(CASE WHEN risk_level = 'Medium' THEN 1 ELSE 0 END) AS medium_count,
+            SUM(CASE WHEN risk_level = 'Healthy' THEN 1 ELSE 0 END) AS healthy_count
+        FROM v_repo_latest_snapshot
         """
     )
     row = cur.fetchone()
@@ -321,6 +350,54 @@ def get_dashboard_summary(conn: MySQLConnection = Depends(get_connection)):
         row[key] = int(row[key]) if row[key] is not None else 0
 
     return row
+
+
+@app.get("/api/stats/declining", response_model=list[DecliningRepo])
+def get_declining_repos(
+    days: int = Query(180, ge=1, description="Compare the latest snapshot with one at least this many days older"),
+    conn: MySQLConnection = Depends(get_connection),
+):
+    """
+    Repos whose bus factor fell or whose risk level worsened over the given
+    window. Runs the sp_declining_repos stored procedure.
+    """
+    cur = conn.cursor(dictionary=True)
+    cur.callproc("sp_declining_repos", (days,))
+    rows = []
+    for result in cur.stored_results():
+        rows.extend(result.fetchall())
+    cur.close()
+
+    # stored_results() cursors aren't dictionary cursors, so rows come back
+    # as tuples in the procedure's column order.
+    keys = ("owner", "name", "then_at", "now_at", "bus_factor_then", "bus_factor_now", "risk_then", "risk_now")
+    return [to_json_types(dict(zip(keys, row))) for row in rows]
+
+
+@app.get("/api/alerts", response_model=list[RiskAlert])
+def get_alerts(
+    limit: int = Query(20, ge=1, le=200),
+    conn: MySQLConnection = Depends(get_connection),
+):
+    """
+    Most recent risk-level increases. Rows are written by the
+    trg_snapshot_risk_alert trigger whenever a sync produces a snapshot
+    that's riskier than the repo's previous one.
+    """
+    cur = conn.cursor(dictionary=True)
+    cur.execute(
+        """
+        SELECT a.alert_id, r.owner, r.name, a.previous_level, a.new_level, a.created_at
+        FROM risk_alert a
+        JOIN repository r ON r.repo_id = a.repo_id
+        ORDER BY a.created_at DESC, a.alert_id DESC
+        LIMIT %s
+        """,
+        (limit,),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return [to_json_types(row) for row in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -407,27 +484,13 @@ def add_repo(payload: AddRepoRequest, conn: MySQLConnection = Depends(get_connec
 
     cur = conn.cursor(dictionary=True)
     cur.execute(
-        f"""
-        SELECT
-            r.repo_id, r.owner, r.name, r.primary_language, r.stars, r.is_archived,
-            s.bus_factor, s.top_contributor_pct, s.active_contributor_count,
-            s.median_issue_response_hours, s.risk_level, s.computed_at
-        {LATEST_SNAPSHOT_JOIN}
-        WHERE r.owner = %s AND r.name = %s
-        """,
+        f"SELECT {SUMMARY_COLUMNS} FROM v_repo_latest_snapshot WHERE owner = %s AND name = %s",
         (owner, name),
     )
     row = cur.fetchone()
     cur.close()
 
-    if row["computed_at"] is not None:
-        row["computed_at"] = row["computed_at"].isoformat()
-    if row["top_contributor_pct"] is not None:
-        row["top_contributor_pct"] = float(row["top_contributor_pct"])
-    if row["median_issue_response_hours"] is not None:
-        row["median_issue_response_hours"] = float(row["median_issue_response_hours"])
-
-    return row
+    return to_json_types(row)
 
 
 @app.delete("/api/repos/{owner}/{name}")

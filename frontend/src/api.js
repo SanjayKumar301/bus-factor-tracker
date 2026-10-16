@@ -33,6 +33,10 @@ export function fetchSummary() {
   return getJSON('/api/stats/summary')
 }
 
+export function fetchAlerts(limit = 10) {
+  return getJSON(`/api/alerts?limit=${limit}`)
+}
+
 export function searchGithub(query) {
   return getJSON(`/api/github/search?q=${encodeURIComponent(query)}`)
 }

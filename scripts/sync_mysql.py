@@ -23,13 +23,19 @@ Run:
 
 import os
 import time
+from pathlib import Path
 import requests
 import mysql.connector
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
-load_dotenv()
+# Resolve paths from this file's location rather than the current directory,
+# so the script also works when launched by Task Scheduler / cron from
+# somewhere else.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+REPOS_FILE = PROJECT_ROOT / "repos.txt"
+load_dotenv(PROJECT_ROOT / ".env")
 
 # Deliberately NOT os.environ["GITHUB_TOKEN"] here — this module gets
 # imported by the FastAPI backend (to reuse sync_repo() for the "add repo"
@@ -66,6 +72,24 @@ def to_mysql_dt(iso_str):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def http_get_with_retry(url, attempts=3):
+    """
+    requests.get(), retried on dropped connections. A long sync run makes
+    thousands of requests, and one reset connection shouldn't fail a repo.
+    HTTP error statuses are NOT retried here — they're handled by callers.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return requests.get(url, headers=HEADERS, timeout=30)
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.Timeout) as e:
+            if attempt == attempts:
+                raise
+            print(f"    network error ({type(e).__name__}), retrying in {2 * attempt}s... ({url})")
+            time.sleep(2 * attempt)
+
+
 def get_json(url, retries=5, initial_wait=2, max_wait=10):
     """
     GET a GitHub API URL. Handles the 202 'stats being computed, try again'
@@ -77,7 +101,7 @@ def get_json(url, retries=5, initial_wait=2, max_wait=10):
     """
     wait = initial_wait
     for attempt in range(retries):
-        resp = requests.get(url, headers=HEADERS)
+        resp = http_get_with_retry(url)
         if resp.status_code == 202:
             print(f"    stats not ready yet, retrying in {wait}s... ({url})")
             time.sleep(wait)
@@ -98,10 +122,28 @@ def fetch_contributor_stats(owner, repo):
     return data or []
 
 
-def fetch_commit_activity(owner, repo):
-    """Total commits per week for the last year. One call."""
-    data = get_json(f"{API_ROOT}/repos/{owner}/{repo}/stats/commit_activity")
-    return data or []
+def fetch_commit_activity(owner, repo, contributor_stats=None):
+    """
+    Total commits per week for the last year. One call.
+
+    GitHub sometimes keeps answering 202 ("still computing") for this
+    endpoint indefinitely, even when stats/contributors for the same repo is
+    ready. Rather than failing the whole repo, fall back to summing the
+    per-week commit counts in the contributor stats we already fetched
+    (slightly undercounts commits from authors without a GitHub account).
+    """
+    try:
+        data = get_json(f"{API_ROOT}/repos/{owner}/{repo}/stats/commit_activity")
+        return data or []
+    except RuntimeError:
+        if not contributor_stats:
+            raise
+        print("    commit_activity not ready — deriving weekly totals from contributor stats")
+        totals = {}
+        for entry in contributor_stats:
+            for w in entry.get("weeks", []):
+                totals[w["w"]] = totals.get(w["w"], 0) + w.get("c", 0)
+        return [{"week": week, "total": totals[week]} for week in sorted(totals)[-52:]]
 
 
 def get_paginated(url, max_pages=3, per_page=100, stop_before=None, updated_field="updated_at"):
@@ -120,7 +162,18 @@ def get_paginated(url, max_pages=3, per_page=100, stop_before=None, updated_fiel
     for page in range(1, max_pages + 1):
         sep = "&" if "?" in url else "?"
         page_url = f"{url}{sep}per_page={per_page}&page={page}"
-        data = get_json(page_url)
+        try:
+            data = get_json(page_url)
+        except requests.exceptions.HTTPError as e:
+            if page == 1 and e.response is not None and e.response.status_code == 404:
+                # A 404 on the FIRST page of /pulls, /issues, or /releases
+                # usually doesn't mean the repo is broken — it means that
+                # feature is disabled on this repo (e.g. FFmpeg/FFmpeg
+                # disables GitHub pull requests entirely; all contributions
+                # go through a mailing list instead). Treat it as "zero
+                # items", not a sync failure.
+                return []
+            raise
         if not data:
             break
 
@@ -255,17 +308,37 @@ def upsert_contributor(cur, username):
     return cur.fetchone()[0]
 
 
-def upsert_repo_contributor(cur, repo_id, contributor_id, total_commits, additions, deletions):
+def upsert_repo_contributor(cur, repo_id, contributor_id, total_commits, additions, deletions,
+                            first_commit_at, last_commit_at):
     cur.execute(
         """
-        INSERT INTO repo_contributor (repo_id, contributor_id, total_commits, additions, deletions)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO repo_contributor
+            (repo_id, contributor_id, total_commits, additions, deletions, first_commit_at, last_commit_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
         ON DUPLICATE KEY UPDATE
             total_commits = VALUES(total_commits),
             additions = VALUES(additions),
-            deletions = VALUES(deletions)
+            deletions = VALUES(deletions),
+            first_commit_at = VALUES(first_commit_at),
+            last_commit_at = VALUES(last_commit_at)
         """,
-        (repo_id, contributor_id, total_commits, additions, deletions),
+        (repo_id, contributor_id, total_commits, additions, deletions, first_commit_at, last_commit_at),
+    )
+
+
+def commit_week_range(weeks):
+    """
+    First and last week (as 'YYYY-MM-DD' week-start dates) in which a
+    contributor made at least one commit, from the stats/contributors
+    per-week breakdown. Week precision is enough for burnout signals,
+    which look at gaps of months, not days.
+    """
+    active = [w["w"] for w in weeks if w.get("c", 0) > 0]
+    if not active:
+        return None, None
+    return (
+        time.strftime("%Y-%m-%d", time.gmtime(min(active))),
+        time.strftime("%Y-%m-%d", time.gmtime(max(active))),
     )
 
 
@@ -328,6 +401,71 @@ def upsert_release(cur, repo_id, published_by_id, release):
         """,
         (release["id"], repo_id, published_by_id, release.get("tag_name"), to_mysql_dt(release.get("published_at"))),
     )
+
+
+# Risk thresholds. Shared by the scoring below and by the backend's
+# "why is this repo at risk" explanation, so the two can never disagree.
+SLOW_RESPONSE_HOURS = 24 * 30        # median first response slower than a month
+ACTIVITY_DROP_PCT = -50.0            # commits/week fell by half or more
+MAINTAINER_INACTIVE_DAYS = 180       # top contributor silent for ~6 months...
+KEY_MAINTAINER_PCT = 25.0            # ...but only counts if they wrote at least this share of commits
+STALE_RELEASE_DAYS = 365             # informational only — many healthy repos don't tag releases
+
+RISK_LEVELS = ["Healthy", "Medium", "High", "Critical"]
+
+
+def assess_risk(bus_factor, top_contributor_pct, median_issue_response_hours, activity_change_pct,
+                top_contributor_days_inactive, days_since_last_release, is_archived):
+    """
+    Returns (risk_level, drivers) where drivers is a list of plain-English
+    reasons. Bus factor sets the base level; each independent burnout
+    warning sign bumps it up one level (capped at Critical). An archived
+    repo is Critical outright — its maintainers have said so.
+    """
+    drivers = []
+
+    if bus_factor == 1:
+        level = 3
+    elif bus_factor == 2:
+        level = 2
+    elif bus_factor <= 4:
+        level = 1
+    else:
+        level = 0
+    share = f" (top contributor: {top_contributor_pct:g}% of commits)" if top_contributor_pct is not None else ""
+    if bus_factor <= 2:
+        people = "1 person wrote" if bus_factor == 1 else f"{bus_factor} people wrote"
+        drivers.append(f"Bus factor {bus_factor}: {people} at least half of all commits{share}")
+    else:
+        drivers.append(f"Bus factor {bus_factor}: work is spread across several people{share}")
+
+    if is_archived:
+        level = 3
+        drivers.insert(0, "Repository is archived by its owner — no longer maintained")
+
+    if median_issue_response_hours is not None and median_issue_response_hours > SLOW_RESPONSE_HOURS:
+        level += 1
+        drivers.append(f"Slow issue responses: median {median_issue_response_hours / 24:.0f} days to first reply")
+
+    if activity_change_pct is not None and activity_change_pct <= ACTIVITY_DROP_PCT:
+        level += 1
+        drivers.append(f"Commit activity down {abs(activity_change_pct):.0f}% in the last 12 weeks vs the 40 before")
+
+    # In a large project the all-time top contributor may have written only
+    # ~10% of the code, and their leaving is routine turnover, not a risk.
+    # It only signals burnout when the project actually leans on that person.
+    if (top_contributor_days_inactive is not None
+            and top_contributor_days_inactive > MAINTAINER_INACTIVE_DAYS
+            and top_contributor_pct is not None
+            and top_contributor_pct >= KEY_MAINTAINER_PCT):
+        level += 1
+        drivers.append(f"Top contributor ({top_contributor_pct:g}% of commits) has not committed in "
+                       f"{top_contributor_days_inactive} days")
+
+    if days_since_last_release is not None and days_since_last_release > STALE_RELEASE_DAYS:
+        drivers.append(f"No release in {days_since_last_release} days")
+
+    return RISK_LEVELS[min(level, 3)], drivers
 
 
 def compute_and_insert_snapshot(cur, repo_id):
@@ -396,34 +534,81 @@ def compute_and_insert_snapshot(cur, repo_id):
     median_row = cur.fetchone()
     median_issue_response_hours = float(median_row[0]) if median_row and median_row[0] is not None else None
 
-    # Risk scoring: bus factor is primary, but a very slow/absent maintainer
-    # response time bumps risk up even if commit concentration alone looked okay.
-    if bus_factor == 1:
-        risk_level = "Critical"
-    elif bus_factor == 2:
-        risk_level = "High"
-    elif bus_factor <= 4:
-        risk_level = "Medium"
-    else:
-        risk_level = "Healthy"
+    # --- Burnout signals ---
+    # Commit activity trend: average commits/week over the last 12 weeks vs
+    # the 40 weeks before that, measured from the repo's newest week of data.
+    # A sharp drop means the people doing the work are slowing down — the
+    # earliest visible sign of a maintainer burning out or drifting away.
+    cur.execute(
+        """
+        SELECT
+            AVG(CASE WHEN w.week_start >  m.latest_week - INTERVAL 12 WEEK
+                     THEN w.commit_count END) AS recent_avg,
+            AVG(CASE WHEN w.week_start <= m.latest_week - INTERVAL 12 WEEK
+                      AND w.week_start >  m.latest_week - INTERVAL 52 WEEK
+                     THEN w.commit_count END) AS baseline_avg
+        FROM weekly_activity w
+        JOIN (SELECT MAX(week_start) AS latest_week FROM weekly_activity WHERE repo_id = %s) m
+        WHERE w.repo_id = %s
+        """,
+        (repo_id, repo_id),
+    )
+    recent_avg, baseline_avg = cur.fetchone()
+    activity_change_pct = None
+    if recent_avg is not None and baseline_avg:  # baseline of 0 / NULL -> no meaningful %
+        activity_change_pct = round(100 * (float(recent_avg) - float(baseline_avg)) / float(baseline_avg), 1)
 
-    if median_issue_response_hours is not None and median_issue_response_hours > 24 * 30:
-        # No response to issues in over a month, on average — bump risk up one level
-        bump = {"Healthy": "Medium", "Medium": "High", "High": "Critical", "Critical": "Critical"}
-        risk_level = bump[risk_level]
+    # How long since the single biggest contributor last committed? If the
+    # person the project depends on most has gone quiet, the bus factor
+    # number is about to become a real outage.
+    cur.execute(
+        """
+        SELECT DATEDIFF(CURDATE(), last_commit_at)
+        FROM repo_contributor
+        WHERE repo_id = %s
+        ORDER BY total_commits DESC
+        LIMIT 1
+        """,
+        (repo_id,),
+    )
+    inactive_row = cur.fetchone()
+    top_contributor_days_inactive = int(inactive_row[0]) if inactive_row and inactive_row[0] is not None else None
+
+    cur.execute(
+        "SELECT DATEDIFF(CURDATE(), MAX(published_at)) FROM repo_release WHERE repo_id = %s",
+        (repo_id,),
+    )
+    release_row = cur.fetchone()
+    days_since_last_release = int(release_row[0]) if release_row and release_row[0] is not None else None
+
+    cur.execute("SELECT is_archived FROM repository WHERE repo_id = %s", (repo_id,))
+    is_archived = bool(cur.fetchone()[0])
+
+    risk_level, _ = assess_risk(
+        bus_factor=bus_factor,
+        top_contributor_pct=top_contributor_pct,
+        median_issue_response_hours=median_issue_response_hours,
+        activity_change_pct=activity_change_pct,
+        top_contributor_days_inactive=top_contributor_days_inactive,
+        days_since_last_release=days_since_last_release,
+        is_archived=is_archived,
+    )
 
     cur.execute(
         """
         INSERT INTO bus_factor_snapshot
             (repo_id, bus_factor, top_contributor_pct, active_contributor_count,
-             median_issue_response_hours, risk_level)
-        VALUES (%s, %s, %s, %s, %s, %s)
+             median_issue_response_hours, activity_change_pct,
+             top_contributor_days_inactive, days_since_last_release, risk_level)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (repo_id, bus_factor, top_contributor_pct, active_contributor_count,
-         median_issue_response_hours, risk_level),
+         median_issue_response_hours, activity_change_pct,
+         top_contributor_days_inactive, days_since_last_release, risk_level),
     )
     median_str = f"{median_issue_response_hours:.0f}h" if median_issue_response_hours is not None else "n/a"
-    print(f"    -> bus_factor={bus_factor}  risk={risk_level}  top_contributor={top_contributor_pct}%  median_response={median_str}")
+    print(f"    -> bus_factor={bus_factor}  risk={risk_level}  top_contributor={top_contributor_pct}%  median_response={median_str}"
+          f"  activity_change={activity_change_pct}%  top_inactive_days={top_contributor_days_inactive}")
 
 
 # How many of the most-recently-updated issues to fetch first-response-comment
@@ -454,7 +639,7 @@ def sync_repo(conn, owner, repo):
 
     meta = fetch_repo_metadata(owner, repo)
     contributor_stats = fetch_contributor_stats(owner, repo)  # always a full aggregate — GitHub has no incremental version
-    commit_activity = fetch_commit_activity(owner, repo)      # same — always a full aggregate
+    commit_activity = fetch_commit_activity(owner, repo, contributor_stats)  # same — always a full aggregate
     issues = fetch_issues(owner, repo, since=since_iso)        # incremental via GitHub's `since` param
     pull_requests = fetch_pull_requests(owner, repo, since=since_iso)  # incremental via early-exit pagination
     releases = fetch_releases(owner, repo, since=since_iso)          # incremental via early-exit pagination, same as PRs
@@ -494,8 +679,11 @@ def sync_repo(conn, owner, repo):
             additions = sum(w.get("a", 0) for w in entry.get("weeks", []))
             deletions = sum(w.get("d", 0) for w in entry.get("weeks", []))
 
+            first_commit_at, last_commit_at = commit_week_range(entry.get("weeks", []))
+
             contributor_id = upsert_contributor(cur, username)
-            upsert_repo_contributor(cur, repo_id, contributor_id, total_commits, additions, deletions)
+            upsert_repo_contributor(cur, repo_id, contributor_id, total_commits, additions, deletions,
+                                    first_commit_at, last_commit_at)
 
         # --- weekly commit activity (for trend/backlog-style queries later) ---
         upsert_weekly_activity(cur, repo_id, commit_activity)
@@ -542,7 +730,7 @@ def main():
         )
 
     run_start = time.time()
-    with open("repos.txt") as f:
+    with open(REPOS_FILE) as f:
         repo_list = [
             line.strip()
             for line in f
