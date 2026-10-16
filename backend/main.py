@@ -256,9 +256,9 @@ def get_repo_detail(owner: str, name: str, conn: MySQLConnection = Depends(get_c
             rc.total_commits,
             rc.additions,
             rc.deletions,
-            ROUND(100 * rc.total_commits / NULLIF((
-                SELECT SUM(rc2.total_commits) FROM repo_contributor rc2 WHERE rc2.repo_id = rc.repo_id
-            ), 0), 1) AS commit_share_pct
+            -- Window function: the repo's total is computed once for the
+            -- whole result, not re-summed per row by a correlated subquery.
+            ROUND(100 * rc.total_commits / NULLIF(SUM(rc.total_commits) OVER (), 0), 1) AS commit_share_pct
         FROM repo_contributor rc
         JOIN contributor c ON c.contributor_id = rc.contributor_id
         WHERE rc.repo_id = %s
@@ -368,10 +368,11 @@ def get_declining_repos(
         rows.extend(result.fetchall())
     cur.close()
 
-    # stored_results() cursors aren't dictionary cursors, so rows come back
-    # as tuples in the procedure's column order.
+    # Depending on the mysql-connector version, stored_results() rows come
+    # back as dicts (dictionary cursor) or as tuples in the procedure's
+    # column order — accept both.
     keys = ("owner", "name", "then_at", "now_at", "bus_factor_then", "bus_factor_now", "risk_then", "risk_now")
-    return [to_json_types(dict(zip(keys, row))) for row in rows]
+    return [to_json_types(dict(row) if isinstance(row, dict) else dict(zip(keys, row))) for row in rows]
 
 
 @app.get("/api/alerts", response_model=list[RiskAlert])

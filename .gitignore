@@ -34,3 +34,13 @@ files*.zip
 
 # ── Sync logs ───────────────────────────────────────────────────────────────────
 logs/
+
+# ── LaTeX build files (keep report.pdf) ─────────────────────────────────────────
+docs/report/*.aux
+docs/report/*.bbl
+docs/report/*.blg
+docs/report/*.log
+docs/report/*.lof
+docs/report/*.lot
+docs/report/*.out
+docs/report/*.toc

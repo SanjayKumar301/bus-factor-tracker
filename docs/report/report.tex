@@ -1,0 +1,1131 @@
+\documentclass[11pt,a4paper]{report}
+
+% ---------------------------------------------------------------------------
+% Packages
+% ---------------------------------------------------------------------------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{setspace}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{listings}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{pdflscape}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,shapes.multipart,fit,calc}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.17}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\onehalfspacing
+\setlength{\emergencystretch}{3em}
+\setlist{itemsep=2pt,topsep=4pt}
+
+% ---------------------------------------------------------------------------
+% Colours and listings
+% ---------------------------------------------------------------------------
+\definecolor{navy}{HTML}{131B2E}
+\definecolor{teal}{HTML}{0B7A6F}
+\definecolor{crit}{HTML}{C8353A}
+\definecolor{high}{HTML}{B8730F}
+\definecolor{med}{HTML}{92650A}
+\definecolor{healthy}{HTML}{0F9488}
+\definecolor{codebg}{HTML}{F4F6FB}
+
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  frame=single, rulecolor=\color{gray!40},
+  keywordstyle=\color{navy}\bfseries,
+  commentstyle=\color{teal}\itshape,
+  stringstyle=\color{crit},
+  breaklines=true, columns=fullflexible,
+  showstringspaces=false, tabsize=4,
+  xleftmargin=4pt, xrightmargin=4pt, aboveskip=8pt, belowskip=8pt
+}
+\lstdefinelanguage{MySQL}[]{SQL}{
+  morekeywords={WITH,OVER,PARTITION,ROW_NUMBER,RETURNS,DETERMINISTIC,TRIGGER,
+    AFTER,EACH,ROW,BEGIN,END,DECLARE,IF,THEN,ELSE,ELSEIF,PROCEDURE,FUNCTION,
+    CALL,REPLACE,VIEW,LIMIT,INTERVAL,DAY,WEEK,MONTH,LEFT,DELIMITER,NEW,
+    DUPLICATE,KEY,CASCADE,ENUM,ENGINE,AUTO_INCREMENT,FIELD,DATEDIFF,
+    TIMESTAMPDIFF,NULLIF,COALESCE},
+  sensitive=false
+}
+\lstset{style=code}
+
+\captionsetup{font=small,labelfont=bf}
+
+% The bibliography chapter is titled "References"
+\renewcommand{\bibname}{References}
+
+% Small helper for risk labels in tables
+\newcommand{\risk}[1]{\textsf{\small #1}}
+
+% ---------------------------------------------------------------------------
+\begin{document}
+
+% ---------------------------------------------------------------------------
+% Title page
+% ---------------------------------------------------------------------------
+\begin{titlepage}
+\centering
+\vspace*{1cm}
+{\large [Name of Institution]\par}
+{\normalsize Department of [Department Name]\par}
+\vspace{2.2cm}
+{\Large\bfseries Database Management Systems --- Course Project Report\par}
+\vspace{1.2cm}
+{\rule{\linewidth}{0.6pt}\par\vspace{0.4cm}}
+{\Huge\bfseries Bus Factor Tracker\par}
+\vspace{0.4cm}
+{\Large Estimating Open-Source Maintainer Burnout and Bus Factor Risk from Real GitHub Data\par}
+\vspace{0.4cm}
+{\rule{\linewidth}{0.6pt}\par}
+\vspace{2cm}
+{\large Submitted by\par}
+\vspace{0.2cm}
+{\large [Student Name] \quad (Roll No.\ [\_\_\_\_\_\_])\par}
+\vspace{1.2cm}
+{\large Under the guidance of\par}
+\vspace{0.2cm}
+{\large [Guide Name]\par}
+\vfill
+{\large Semester V \quad\textbullet\quad October 2026\par}
+\end{titlepage}
+
+% ---------------------------------------------------------------------------
+\begin{abstract}
+\noindent
+Open-source software forms the base layer of almost every modern application,
+yet much of it is maintained by a handful of volunteers. When such a maintainer
+burns out or leaves, every project that depends on their work is exposed, often
+with no warning. The \emph{bus factor} of a project, the number of people who
+would have to disappear before it stalls, is a simple measure of this risk.
+
+This report presents the \textbf{Bus Factor Tracker}, a database-centred system
+that estimates bus factor and maintainer-burnout risk for real GitHub
+repositories from public data only. A Python sync engine pulls repository
+metadata, per-contributor commit statistics, weekly activity, issues, pull
+requests and releases from the GitHub REST API into a MySQL~8.0 database of
+nine relations in Boyce--Codd normal form. Each repository is written inside a
+single ACID transaction. Bus factor and median issue-response time are computed
+in SQL with common table expressions and window functions, and three burnout
+signals (commit-activity decline, inactivity of the top contributor, and slow
+issue responses) adjust a base risk level derived from the bus factor. A view,
+a stored function, a stored procedure and a trigger expose the latest risk
+state, detect declining repositories and record every risk increase. A FastAPI
+service and a React dashboard present the results with a plain-English
+explanation of each score.
+
+Applied to 42 widely used repositories (17,306 contributors, 16,490 pull
+requests, 6,211 issues), the system found that 17 repositories (40\%) have a
+bus factor of~1. Adding the burnout signals moved 9 repositories up at least
+one risk level, each change being logged automatically by the trigger. All
+read endpoints of the API respond in under 10\,ms. The report also discusses
+the limitations observed on real data, such as automation bots appearing as
+top contributors, and the design decisions they motivate.
+
+\vspace{0.6em}
+\noindent\textbf{Keywords:} bus factor, truck factor, open-source sustainability,
+maintainer burnout, relational database, MySQL, window functions, triggers,
+GitHub REST API.
+\end{abstract}
+
+\tableofcontents
+\listoffigures
+\listoftables
+
+% ===========================================================================
+\chapter{Introduction}
+% ===========================================================================
+
+\section{Background}
+
+Open-source libraries are reused at enormous scale: a single web application
+can pull in hundreds of transitive dependencies, each maintained by people the
+application's developers have never met. Studies of the open-source ecosystem
+describe this as critical public infrastructure that is largely maintained
+without pay~\cite{eghbal2016roads,eghbal2020working}. The consequences of a
+single maintainer's decision became widely visible in March 2016, when the
+removal of the eleven-line \texttt{left-pad} package from the npm registry
+broke the builds of thousands of downstream projects~\cite{npm2016leftpad}.
+
+Less dramatic versions of the same failure happen continually. Maintainers
+lose interest, change jobs or simply burn out, and projects that looked healthy
+from the outside stop receiving fixes. Research on failed open-source projects
+lists lack of maintainer time and interest among the most common reasons a
+project is abandoned~\cite{coelho2017fail}, and toxic or demanding interactions
+with users are a documented source of maintainer stress~\cite{raman2020stress}.
+
+\section{The bus factor}
+
+The \emph{bus factor} (also called the \emph{truck factor}) of a software
+project is the minimum number of developers who would have to leave the project
+(``be hit by a bus'') before it can no longer be maintained. A bus factor of~1
+means that a single person holds knowledge or responsibility the project cannot
+function without. Several algorithms have been proposed to estimate it from
+version-control history, including file-authorship approaches
+\cite{avelino2016truck} and commit-based approaches applied directly to Git
+repositories~\cite{cosentino2015bus}. Practitioners report that the metric is
+useful but that raw estimates need context to be acted on~\cite{jabrayilzade2022bus}.
+
+\section{Problem statement}
+
+Developers choosing a dependency, and organisations funding open-source work,
+have no simple way to see which projects are one person away from
+abandonment. Existing tools either show raw activity graphs for a single
+repository, focus on security practices, or require a heavyweight analytics
+platform (Section~\ref{sec:related}). The problem addressed in this project is:
+
+\begin{quote}
+\itshape
+Design and build a database-backed system that estimates the bus factor and
+maintainer-burnout risk of real GitHub repositories from public data,
+explains each estimate, and tracks how the risk changes over time.
+\end{quote}
+
+\section{Objectives}
+
+\begin{enumerate}
+  \item Collect real repository, contributor, issue, pull-request and release
+        data from the GitHub REST API --- no simulated data.
+  \item Design a normalised relational schema (BCNF) with full referential
+        integrity, suitable for both current-state queries and time-series
+        history.
+  \item Compute the bus factor, median issue-response time and burnout signals
+        inside the database using SQL (CTEs and window functions).
+  \item Use DBMS features where they fit the problem: transactions for
+        consistent syncs, a view, a stored function, a stored procedure and a
+        trigger.
+  \item Combine the measurements into an explainable risk level per
+        repository, and record every increase in risk.
+  \item Present the results through a REST API and an interactive web
+        dashboard.
+\end{enumerate}
+
+\section{Scope}
+
+The system tracks a configurable list of public GitHub repositories (42 in the
+evaluation, chosen to mix large, well-staffed projects with small
+single-maintainer utilities and one archived project). It relies on the data
+GitHub exposes through its public API with a personal access token. It does not
+analyse source code, mailing lists or chat channels, and it does not attempt
+per-file authorship analysis.
+
+\section{Related work}
+\label{sec:related}
+
+\paragraph{Truck-factor research.} Avelino et al.~\cite{avelino2016truck}
+estimate truck factors from file authorship (degree-of-authorship) and
+validate the estimates with developers of popular GitHub projects. Cosentino
+et al.~\cite{cosentino2015bus} compute bus-factor indicators for Git
+repositories. Jabrayilzade et al.~\cite{jabrayilzade2022bus} study how the bus
+factor is used in industry. These works analyse repositories at a point in
+time; they do not maintain a continuously updated history or alert on change.
+
+\paragraph{Community-health tooling.} The CHAOSS project~\cite{chaoss} defines a
+broad catalogue of open-source community-health metrics and provides
+analytics platforms to compute them. The OpenSSF Scorecard~\cite{scorecard}
+assesses security-related practices of a repository, including whether it has
+been recently active. GitHub's own repository Insights pages show activity
+graphs for one repository at a time.
+
+\paragraph{This project.} The Bus Factor Tracker sits between these: it is a
+lightweight, single-purpose system that (i) combines commit concentration with
+burnout signals into one explainable risk level, (ii) ranks many repositories
+side by side, and (iii) keeps an append-only history so that declines and risk
+increases are detected inside the database itself.
+
+\section{Organisation of the report}
+
+Chapter~\ref{ch:method} describes the system architecture, data collection,
+database design, SQL techniques and risk-scoring method.
+Chapter~\ref{ch:results} presents the results on 42 real repositories and
+discusses them, including performance, validation cases and limitations.
+Chapter~\ref{ch:conclusion} concludes and outlines future work.
+
+% ===========================================================================
+\chapter{Methodology}
+\label{ch:method}
+% ===========================================================================
+
+\section{System architecture}
+
+The system is split into four modules connected by the database
+(Figure~\ref{fig:arch}). Collecting data is slow (tens of seconds of API calls
+per repository) while reading results must be fast, so the two are deliberately
+separated: the sync engine writes, and the API almost only reads.
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  box/.style={draw=navy, line width=0.8pt, rounded corners=3pt, fill=codebg,
+              minimum height=1.5cm, minimum width=2.6cm, align=center, font=\small},
+  ext/.style={box, fill=white, dashed},
+  arr/.style={-{Stealth[length=3mm]}, line width=0.9pt, draw=teal}
+]
+\node[ext] (gh) {GitHub\\REST API};
+\node[box, right=1.9cm of gh] (sync) {\textbf{Sync engine}\\Python 3.12\\\footnotesize sync\_mysql.py};
+\node[box, right=1.9cm of sync, fill=navy, text=white] (db) {\textbf{MySQL 8.0}\\\footnotesize 9 tables, view,\\\footnotesize function, procedure,\\\footnotesize trigger};
+\node[box, right=1.9cm of db] (api) {\textbf{REST API}\\FastAPI\\\footnotesize 9 endpoints};
+\node[box, right=1.9cm of api] (ui) {\textbf{Dashboard}\\React + Recharts};
+\node[ext, above=0.8cm of sync, minimum height=0.9cm] (sched) {\footnotesize Windows Task Scheduler\\\footnotesize (daily, 09:00)};
+\draw[arr] (gh) -- node[above, font=\scriptsize, align=center]{JSON} (sync);
+\draw[arr] (sync) -- node[above, font=\scriptsize, align=center]{1 transaction\\per repo} (db);
+\draw[arr] (db) -- node[above, font=\scriptsize, align=center]{SQL reads\\(view, proc.)} (api);
+\draw[arr] (api) -- node[above, font=\scriptsize, align=center]{HTTP\\JSON} (ui);
+\draw[arr, dashed] (sched) -- (sync);
+\end{tikzpicture}}
+\caption{System architecture and data flow.}
+\label{fig:arch}
+\end{figure}
+
+\section{Data collection}
+
+The sync engine (\texttt{scripts/sync\_mysql.py}) reads the list of tracked
+repositories from \texttt{repos.txt} and, for each repository, calls the GitHub
+REST API endpoints in Table~\ref{tab:endpoints}~\cite{github_rest}.
+
+\begin{table}[H]
+\centering
+\caption{GitHub REST API endpoints used per repository.}
+\label{tab:endpoints}
+\small
+\begin{tabularx}{\textwidth}{>{\ttfamily}l X}
+\toprule
+\textrm{\textbf{Endpoint}} & \textbf{Data obtained} \\
+\midrule
+/repos/\{o\}/\{r\} & Language, stars, forks, creation date, archived flag \\
+/repos/\{o\}/\{r\}/stats/contributors & Per-contributor commit, addition and deletion counts, broken down by week \\
+/repos/\{o\}/\{r\}/stats/commit\_activity & Total commits per week for the last 52 weeks \\
+/repos/\{o\}/\{r\}/issues & Issues (state, opened/closed time, author); pull requests filtered out \\
+/repos/\{o\}/\{r\}/issues/\{n\}/comments & First comment on an issue, giving the first-response time \\
+/repos/\{o\}/\{r\}/pulls & Pull requests (state, opened/merged time, author) \\
+/repos/\{o\}/\{r\}/releases & Releases (tag, publish time, author) \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Several design choices keep the sync within GitHub's limit of 5,000
+authenticated requests per hour and make it robust:
+
+\begin{itemize}
+  \item \textbf{Pre-aggregated statistics.} Contributor and weekly-activity
+        statistics come from GitHub's \texttt{stats} endpoints, one call each,
+        instead of one call per commit.
+  \item \textbf{Incremental sync.} The repository's \texttt{last\_synced\_at}
+        timestamp is read before each sync; issues are requested with GitHub's
+        \texttt{since} parameter, and pull-request and release pagination stops
+        as soon as it reaches items older than the last sync.
+  \item \textbf{Capped work.} Pagination is capped at three pages, and the
+        first-response lookup is limited to the 30 most recently updated
+        issues with comments; those lookups run concurrently (10 threads).
+  \item \textbf{Lazy statistics.} GitHub computes \texttt{stats} endpoints in the
+        background and answers \texttt{202 Accepted} until they are ready. The
+        engine retries with capped exponential back-off (2, 4, 8, 10, 10\,s).
+        If \texttt{commit\_activity} never becomes ready, weekly totals are
+        derived by summing the per-week counts already returned by
+        \texttt{stats/contributors}.
+  \item \textbf{Network resilience.} Dropped connections, truncated responses
+        and time-outs are retried up to three times per request.
+  \item \textbf{No network I/O inside a transaction.} All API calls for a
+        repository complete before its database transaction begins, so slow
+        responses never hold locks.
+\end{itemize}
+
+A Windows Task Scheduler job runs the sync daily, so that each repository
+gains one snapshot per day and trends become measurable over time.
+
+\section{Database design}
+
+\subsection{Entity--relationship model}
+
+The conceptual model (Figure~\ref{fig:er}) follows Chen's entity--relationship
+approach~\cite{chen1976er}. \textsc{Repository} and \textsc{Contributor} are the
+two strong entities. Their many-to-many relationship carries its own
+attributes (commit counts and first/last commit dates), so it is modelled as
+the associative entity \textsc{Repo\_Contributor}. \textsc{Weekly\_Activity} is
+a weak entity identified by its repository and week. Snapshots and alerts form
+an append-only history.
+
+\begin{landscape}
+\begin{figure}[p]
+\centering
+\begin{tikzpicture}[
+  ent/.style={draw=navy, line width=0.8pt, rectangle split, rectangle split parts=2,
+              rectangle split part fill={navy,white}, align=left, font=\footnotesize,
+              inner sep=5pt, text width=4.9cm, anchor=north},
+  rel/.style={line width=0.8pt, draw=navy!75},
+  opt/.style={rel, dashed},
+  card/.style={font=\footnotesize\bfseries, text=teal, fill=white, inner sep=1.5pt}
+]
+% Row 1
+\node[ent] (wa) at (0,0) {\textcolor{white}{\textbf{WEEKLY\_ACTIVITY}} \textcolor{white}{\scriptsize(weak)}
+  \nodepart{two} \underline{\textit{repo\_id}} PK, FK\\\underline{week\_start} PK\\commit\_count};
+\node[ent] (repo) at (6.4,0) {\textcolor{white}{\textbf{REPOSITORY}}
+  \nodepart{two} \underline{repo\_id} PK\\owner, name \quad UNIQUE\\primary\_language\\stars, forks, created\_at\\is\_archived\\last\_synced\_at};
+\node[ent] (rc) at (12.8,0) {\textcolor{white}{\textbf{REPO\_CONTRIBUTOR}} \textcolor{white}{\scriptsize(assoc.)}
+  \nodepart{two} \underline{\textit{repo\_id}} PK, FK\\\underline{\textit{contributor\_id}} PK, FK\\total\_commits\\additions, deletions\\first\_commit\_at\\last\_commit\_at};
+\node[ent] (con) at (19.2,0) {\textcolor{white}{\textbf{CONTRIBUTOR}}
+  \nodepart{two} \underline{contributor\_id} PK\\github\_username \quad UNIQUE\\github\_account\_created\_at};
+% Row 2
+\node[ent] (snap) at (0,-5.6) {\textcolor{white}{\textbf{BUS\_FACTOR\_SNAPSHOT}}
+  \nodepart{two} \underline{snapshot\_id} PK\\\textit{repo\_id} FK\\computed\_at\\bus\_factor\\top\_contributor\_pct\\active\_contributor\_count\\median\_issue\_response\_hours\\activity\_change\_pct\\top\_contributor\_days\_inactive\\days\_since\_last\_release\\risk\_level};
+\node[ent] (iss) at (6.4,-5.6) {\textcolor{white}{\textbf{ISSUE}}
+  \nodepart{two} \underline{issue\_id} PK\\\textit{repo\_id} FK, \textit{opened\_by} FK\\state, created\_at\\first\_response\_at\\closed\_at};
+\node[ent] (pr) at (12.8,-5.6) {\textcolor{white}{\textbf{PULL\_REQUEST}}
+  \nodepart{two} \underline{pr\_id} PK\\\textit{repo\_id} FK, \textit{opened\_by} FK\\state, created\_at\\merged\_at};
+\node[ent] (rel) at (19.2,-5.6) {\textcolor{white}{\textbf{REPO\_RELEASE}}
+  \nodepart{two} \underline{release\_id} PK\\\textit{repo\_id} FK\\\textit{published\_by} FK\\tag\_name, published\_at};
+% Row 3
+\node[ent] (alert) at (6.4,-9.6) {\textcolor{white}{\textbf{RISK\_ALERT}}
+  \nodepart{two} \underline{alert\_id} PK\\\textit{repo\_id} FK, \textit{snapshot\_id} FK\\previous\_level, new\_level\\created\_at};
+
+% Repository relationships (1 : N)
+\draw[rel] (repo.west |- wa.east) -- node[card, pos=0.12]{1} node[card, pos=0.88]{N} (wa.east);
+\draw[rel] (repo.east |- rc.west) -- node[card, pos=0.12]{1} node[card, pos=0.88]{N} (rc.west);
+\draw[rel] (repo.south) -- node[card, pos=0.15]{1} node[card, pos=0.85]{N} (iss.north);
+\draw[rel] ([xshift=-1.2cm]repo.south) -- node[card, pos=0.12]{1} node[card, pos=0.88]{N} ([xshift=1.2cm]snap.north);
+\draw[rel] ([xshift=1.2cm]repo.south) -- node[card, pos=0.12]{1} node[card, pos=0.88]{N} ([xshift=-1.2cm]pr.north);
+\draw[rel] (repo.south east) -- node[card, pos=0.08]{1} node[card, pos=0.94]{N} ([xshift=-1.6cm]rel.north);
+% Contributor relationships
+\draw[rel] (con.west |- rc.east) -- node[card, pos=0.12]{1} node[card, pos=0.88]{N} (rc.east);
+\draw[opt] ([xshift=1.2cm]con.south) -- node[card, pos=0.15]{0..1} node[card, pos=0.85]{N} ([xshift=1.2cm]rel.north);
+\draw[opt] ([xshift=-1.2cm]con.south) -- node[card, pos=0.12]{0..1} node[card, pos=0.88]{N} ([xshift=1.2cm]pr.north);
+\draw[opt] (con.south west) -- node[card, pos=0.08]{0..1} node[card, pos=0.94]{N} ([xshift=1.8cm]iss.north);
+% Snapshot -> alert
+\draw[rel] (snap.east |- alert.west) -- node[card, pos=0.12]{1} node[card, pos=0.85]{0..1} (alert.west);
+\end{tikzpicture}
+\caption{Entity--relationship diagram. Underlined attributes form the primary key; italic
+attributes are foreign keys. Solid lines are mandatory relationships, dashed lines optional
+ones (a deleted GitHub account leaves the author unknown). \textsc{Risk\_Alert} also
+references \textsc{Repository} (not drawn).}
+\label{fig:er}
+\end{figure}
+\end{landscape}
+
+\subsection{Relational schema}
+
+The ER model maps to nine relations (Table~\ref{tab:schema}). GitHub's own
+identifiers are used as primary keys for issues, pull requests and releases
+(\texttt{BIGINT}), which makes re-syncing idempotent and guarantees that keys
+never collide across repositories. \texttt{release} is a reserved word in
+MySQL, hence \texttt{repo\_release}.
+
+\begin{table}[H]
+\centering
+\caption{Relations, keys and purpose.}
+\label{tab:schema}
+\small
+\begin{tabularx}{\textwidth}{>{\ttfamily}l >{\raggedright\arraybackslash}p{5.6cm} X}
+\toprule
+\textrm{\textbf{Relation}} & \textbf{Primary key / foreign keys} & \textbf{Purpose} \\
+\midrule
+repository & repo\_id; UNIQUE(owner, name) & One row per tracked repository \\
+contributor & contributor\_id; UNIQUE(github\_username) & People, shared across repositories \\
+repo\_contributor & (repo\_id, contributor\_id) & Associative entity: commits per person per repository \\
+issue & issue\_id; FK repo\_id, opened\_by & Issues with first-response time \\
+pull\_request & pr\_id; FK repo\_id, opened\_by & Pull requests \\
+repo\_release & release\_id; FK repo\_id, published\_by & Releases \\
+weekly\_activity & (repo\_id, week\_start) & Weak entity: commits per week \\
+bus\_factor\_snapshot & snapshot\_id; FK repo\_id & Append-only time series of computed risk \\
+risk\_alert & alert\_id; FK repo\_id, snapshot\_id & Written by a trigger when risk increases \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Referential integrity.} Every child relation references
+\texttt{repository(repo\_id)} with \texttt{ON DELETE CASCADE}. Removing a
+repository from the dashboard is therefore a single \texttt{DELETE} statement,
+and the DBMS removes its contributor statistics, issues, pull requests,
+releases, weekly activity, snapshots and alerts in the same operation.
+Contributors are shared between repositories, so they are deliberately not
+cascaded.
+
+\subsection{Normalisation}
+
+All relations are in Boyce--Codd normal form: for every non-trivial functional
+dependency $X \rightarrow Y$, $X$ is a superkey~\cite{codd1970relational,silberschatz2019db,elmasri2016fundamentals}.
+Table~\ref{tab:nf} shows how each normal form is reflected in the design.
+
+\begin{table}[H]
+\centering
+\caption{Normal forms as applied to the schema.}
+\label{tab:nf}
+\small
+\begin{tabularx}{\textwidth}{l X}
+\toprule
+\textbf{Normal form} & \textbf{Application} \\
+\midrule
+1NF & Contributors of a repository are rows in \texttt{repo\_contributor}, not a
+comma-separated list; weekly activity is one row per week, not an array. \\
+2NF & In \texttt{repo\_contributor}, \texttt{total\_commits} depends on the
+whole key (\texttt{repo\_id}, \texttt{contributor\_id}); \texttt{github\_username}
+depends on \texttt{contributor\_id} alone and therefore lives in \texttt{contributor}. \\
+3NF & \texttt{risk\_level} is derived from the bus factor and burnout signals and
+changes on every sync, so it is stored on the snapshot that produced it, never
+on \texttt{repository}. \\
+BCNF & \texttt{repository} has two candidate keys, \texttt{repo\_id} and
+(\texttt{owner}, \texttt{name}); both determine all other attributes. The same
+holds for \texttt{contributor}. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\paragraph{Deliberate redundancy.} \texttt{bus\_factor\_snapshot} stores values
+that could in principle be recomputed from other relations. This is
+intentional: the source relations are overwritten on each sync, so a snapshot
+is the only record of what the measurements \emph{were} at
+\texttt{computed\_at}.
+
+\subsection{Indexes}
+
+Besides primary keys and unique constraints, secondary indexes support the
+most frequent access paths: \texttt{(repo\_id, computed\_at)} on snapshots for
+``latest snapshot'' and trend queries, \texttt{repo\_id} on
+\texttt{repo\_contributor} and \texttt{issue} for per-repository aggregation,
+and \texttt{created\_at} on \texttt{risk\_alert} for the newest-first alert feed.
+
+\section{Transaction design}
+
+Each repository is synchronised in one transaction (Listing~\ref{lst:txn}),
+following the atomicity and durability guarantees of ACID
+transactions~\cite{haerder1983principles}. If any step fails, such as a network error
+during the preceding fetch, a malformed row or a lost database connection, the
+whole repository rolls back. The previous snapshot then remains the latest
+one, so the dashboard never shows a score computed from half-updated data.
+Every write except the snapshot is an \texttt{INSERT \ldots\ ON DUPLICATE KEY
+UPDATE}, making repeated syncs idempotent.
+
+\begin{lstlisting}[language=Python, caption={Per-repository transaction (simplified from \texttt{sync\_repo}).}, label={lst:txn}]
+cur = conn.cursor()            # conn.autocommit = False
+try:
+    repo_id = upsert_repo(cur, owner, repo, meta)
+    for entry in contributor_stats:
+        upsert_repo_contributor(cur, repo_id, ...)
+    upsert_weekly_activity(cur, repo_id, commit_activity)
+    for issue in issues:        upsert_issue(cur, repo_id, ...)
+    for pr in pull_requests:    upsert_pull_request(cur, repo_id, ...)
+    for release in releases:    upsert_release(cur, repo_id, ...)
+    compute_and_insert_snapshot(cur, repo_id)   # fires the trigger
+    conn.commit()
+except Exception:
+    conn.rollback()             # nothing for this repository is kept
+    raise
+\end{lstlisting}
+
+\section{Computing the measurements in SQL}
+
+\subsection{Bus factor}
+
+The bus factor is computed as the smallest number of top contributors who
+together authored at least 50\% of all commits. Listing~\ref{lst:bf} does this
+in a single pass with a common table expression and window functions: contributors
+are ranked by commits, a running total is accumulated in that order, and the
+first rank at which the running total reaches half the repository's total is
+the bus factor.
+
+\begin{lstlisting}[language=MySQL, caption={Bus factor, top-contributor share and contributor count.}, label={lst:bf}]
+WITH ranked_contributors AS (
+    SELECT contributor_id, total_commits,
+           SUM(total_commits) OVER ()                            AS repo_total_commits,
+           SUM(total_commits) OVER (ORDER BY total_commits DESC) AS running_total,
+           ROW_NUMBER()       OVER (ORDER BY total_commits DESC) AS contributor_rank,
+           COUNT(*)           OVER ()                            AS contributor_count
+    FROM repo_contributor
+    WHERE repo_id = %s
+)
+SELECT MIN(CASE WHEN running_total >= 0.5 * repo_total_commits
+                THEN contributor_rank END)                       AS bus_factor,
+       MAX(CASE WHEN contributor_rank = 1
+                THEN ROUND(100 * total_commits / repo_total_commits, 1) END)
+                                                                 AS top_contributor_pct,
+       MAX(contributor_count)                                    AS contributor_count
+FROM ranked_contributors;
+\end{lstlisting}
+
+\subsection{Median issue-response time}
+
+\texttt{PERCENTILE\_CONT} is only available from MySQL~8.0.28~\cite{mysql_manual}, so the median
+time to the first comment on an issue uses a portable window-function median:
+response times are numbered with \texttt{ROW\_NUMBER()}, counted with
+\texttt{COUNT(*) OVER ()}, and the middle one or two rows are averaged.
+
+\subsection{Burnout signals}
+
+Three signals are computed for each snapshot:
+
+\begin{description}
+  \item[Commit-activity change.] Using conditional aggregation over
+        \texttt{weekly\_activity}, the average commits per week in the most
+        recent 12 weeks is compared with the average over the 40 weeks before:
+        \[
+          \Delta_{\text{act}} = 100 \times
+          \frac{\overline{c}_{\text{last 12 wk}} - \overline{c}_{\text{prev 40 wk}}}
+               {\overline{c}_{\text{prev 40 wk}}} \;\%.
+        \]
+  \item[Top-contributor inactivity.] Days since the last commit of the
+        contributor with the most commits, from
+        \texttt{repo\_contributor.last\_commit\_at} (derived from the last week
+        with a non-zero commit count).
+  \item[Slow issue response.] The median issue-response time described above.
+\end{description}
+
+Days since the latest release is also stored, but only as context: many
+healthy libraries never publish GitHub releases.
+
+\section{Risk scoring}
+
+Algorithm~\ref{alg:risk} combines the measurements. The bus factor sets a base
+level; an archived repository is Critical outright; and each independent
+burnout signal raises the level by one, capped at Critical. The function
+returns the level together with a list of plain-English reasons. The same
+function is used by the sync engine (to store the level) and by the API (to
+explain it), so the explanation always matches the stored score.
+
+\begin{algorithm}[H]
+\caption{Risk assessment (\texttt{assess\_risk})}
+\label{alg:risk}
+\begin{algorithmic}[1]
+\Require bus factor $b$, top-contributor share $s$ (\%), median response $m$ (h),
+         activity change $a$ (\%), top-contributor inactivity $d$ (days), archived flag
+\Ensure risk level $L \in \{0, 1, 2, 3\}$ (Healthy, Medium, High, Critical) and reasons $R$
+\State $L \gets 3$ \textbf{if} $b = 1$ \textbf{else} $2$ \textbf{if} $b = 2$
+       \textbf{else} $1$ \textbf{if} $b \le 4$ \textbf{else} $0$
+\State $R \gets$ [explanation of $b$ and $s$]
+\If{archived} \State $L \gets 3$; add ``repository is archived'' to $R$ \EndIf
+\If{$m > 720$} \State $L \gets L + 1$; add ``slow issue responses'' to $R$ \EndIf
+\If{$a \le -50$} \State $L \gets L + 1$; add ``commit activity down'' to $R$ \EndIf
+\If{$d > 180$ \textbf{and} $s \ge 25$}
+  \State $L \gets L + 1$; add ``top contributor inactive'' to $R$
+\EndIf
+\State \Return $(\min(L, 3),\ R)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{table}[H]
+\centering
+\caption{Risk levels and burnout thresholds.}
+\label{tab:thresholds}
+\small
+\begin{tabularx}{\textwidth}{l X l}
+\toprule
+\textbf{Component} & \textbf{Condition} & \textbf{Effect} \\
+\midrule
+Bus factor & 1 / 2 / 3--4 / $\ge 5$ & Critical / High / Medium / Healthy \\
+Archived repository & \texttt{is\_archived = TRUE} & Critical \\
+Slow issue responses & median first reply $> 30$ days & $+1$ level \\
+Activity decline & last 12 weeks $\ge 50\%$ below previous 40 & $+1$ level \\
+Top contributor inactive & no commit $> 180$ days \emph{and} share $\ge 25\%$ & $+1$ level \\
+Release recency & days since last release & shown only \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The 25\% share condition on the inactivity signal was added after testing on
+real data (Section~\ref{sec:calibration}).
+
+\section{Database objects}
+
+\paragraph{View.} \texttt{v\_repo\_latest\_snapshot} joins every repository to
+its newest snapshot (a \texttt{LEFT JOIN}, so repositories without a snapshot
+still appear). Selecting the newest row by \texttt{snapshot\_id} rather than
+\texttt{MAX(computed\_at)} avoids duplicate rows when two snapshots share a
+timestamp. All API endpoints that need ``current state'' read from this view.
+
+\paragraph{Stored function.} \texttt{fn\_risk\_rank(level)} maps Healthy,
+Medium, High and Critical to 1--4. The \texttt{ENUM} stores the levels in the
+opposite order, so this function is the single definition of ``worse than'',
+used by the trigger, the procedure and the API's risk ordering.
+
+\paragraph{Stored procedure.} \texttt{sp\_declining\_repos(p\_days)} pairs each
+repository's latest snapshot with the newest snapshot at least \texttt{p\_days}
+older and returns repositories whose bus factor fell or whose risk level rose.
+
+\paragraph{Trigger.} \texttt{trg\_snapshot\_risk\_alert} (Listing~\ref{lst:trg})
+fires after every snapshot insert, compares the new risk level with the
+repository's previous snapshot, and writes a row to \texttt{risk\_alert} when
+the risk has increased. Because it runs inside the sync transaction, a
+rolled-back sync can never leave an alert pointing at a snapshot that does not
+exist.
+
+\begin{lstlisting}[language=MySQL, caption={Trigger recording risk increases.}, label={lst:trg}]
+CREATE TRIGGER trg_snapshot_risk_alert
+AFTER INSERT ON bus_factor_snapshot
+FOR EACH ROW
+BEGIN
+    DECLARE v_prev_level VARCHAR(10);
+    SET v_prev_level = (
+        SELECT s.risk_level FROM bus_factor_snapshot s
+        WHERE s.repo_id = NEW.repo_id AND s.snapshot_id <> NEW.snapshot_id
+        ORDER BY s.computed_at DESC, s.snapshot_id DESC
+        LIMIT 1);
+    IF v_prev_level IS NOT NULL
+       AND fn_risk_rank(NEW.risk_level) > fn_risk_rank(v_prev_level) THEN
+        INSERT INTO risk_alert (repo_id, snapshot_id, previous_level, new_level)
+        VALUES (NEW.repo_id, NEW.snapshot_id, v_prev_level, NEW.risk_level);
+    END IF;
+END
+\end{lstlisting}
+
+\section{Application layer}
+
+\paragraph{REST API.} A FastAPI~\cite{fastapi} service exposes nine endpoints:
+a risk-ranked repository list with filtering and sorting, repository detail
+with contributor breakdown and risk reasons, snapshot history, dashboard
+summary counts, declining repositories (via the stored procedure), recent
+alerts, GitHub search, and adding or removing a tracked repository. Database
+connections come from a pool of five; every query is parameterised.
+
+\paragraph{Dashboard.} A React~\cite{react} single-page application
+(Figure~\ref{fig:dashboard}) shows summary counts per risk level, the recent
+risk increases, and a searchable, filterable risk-ranked table. The detail page
+(Figure~\ref{fig:detail}) shows the bus factor, the reasons for the risk level,
+the burnout signals, a bus-factor trend chart and the contributor breakdown.
+
+% ===========================================================================
+\chapter{Results and Discussion}
+\label{ch:results}
+% ===========================================================================
+
+\section{Experimental setup}
+
+The system was run on a Windows~11 laptop with MySQL Community Server 8.0.46,
+Python~3.12 and Node.js. The tracked list contained 43 public repositories:
+large, well-staffed projects (e.g.\ React, Kubernetes, CPython, Rust),
+popular single-maintainer utilities (e.g.\ \texttt{is-number}, \texttt{p-limit},
+\texttt{chalk}), libraries known to be in maintenance mode or deprecated
+(\texttt{request}, \texttt{moment}) and one archived project
+(\texttt{jquery-mobile}). Snapshots were collected between 11 August and
+16 October 2026; all figures below use each repository's latest snapshot from
+the full sync of 16 October 2026.
+
+\section{Data collected}
+
+One repository (\texttt{substack/node-mkdirp}) no longer exists on GitHub and
+returned HTTP 404; the remaining 42 were synchronised. Table~\ref{tab:counts}
+lists the resulting row counts.
+
+\begin{table}[H]
+\centering
+\caption{Rows stored per relation after the full sync.}
+\label{tab:counts}
+\small
+\begin{tabular}{lr@{\hspace{3em}}lr}
+\toprule
+\textbf{Relation} & \textbf{Rows} & \textbf{Relation} & \textbf{Rows} \\
+\midrule
+repository & 42 & repo\_release & 3,145 \\
+contributor & 17,306 & weekly\_activity & 2,549 \\
+repo\_contributor & 10,052 & bus\_factor\_snapshot & 202 \\
+issue & 6,211 & risk\_alert & 9 \\
+pull\_request & 16,490 & & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Of the 6,211 issues, 1,510 have a recorded first-response time (only the 30
+most recently updated issues with comments are looked up per sync).
+
+\section{Risk distribution}
+
+Figure~\ref{fig:dist} and Table~\ref{tab:dist} summarise the risk levels.
+\textbf{17 of the 42 repositories (40\%) have a bus factor of~1}: a single
+person wrote at least half of all their commits. A further 4 have a bus factor
+of~2. After the burnout signals are applied, 24 repositories are Critical,
+4 High, none Medium and 14 Healthy.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  ybar, bar width=26pt, bar shift=0pt, width=0.62\textwidth, height=5.6cm,
+  symbolic x coords={Critical,High,Medium,Healthy}, xtick={Critical,High,Medium,Healthy},
+  ymin=0, ymax=28, ylabel={Repositories},
+  nodes near coords, nodes near coords style={font=\small},
+  axis lines*=left, ymajorgrids, grid style={gray!20},
+  enlarge x limits=0.18, tick label style={font=\small}
+]
+\addplot[fill=crit, draw=none] coordinates {(Critical,24)};
+\addplot[fill=high, draw=none] coordinates {(High,4)};
+\addplot[fill=med, draw=none] coordinates {(Medium,0)};
+\addplot[fill=healthy, draw=none] coordinates {(Healthy,14)};
+\end{axis}
+\end{tikzpicture}
+\caption{Risk level of the 42 repositories (latest snapshot).}
+\label{fig:dist}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Risk levels with average bus factor and top-contributor share.}
+\label{tab:dist}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Risk level} & \textbf{Repositories} & \textbf{Avg.\ bus factor} & \textbf{Avg.\ top-contributor share} \\
+\midrule
+Critical & 24 & 1.5 & 60.7\% \\
+High & 4 & 3.3 & 28.9\% \\
+Medium & 0 & --- & --- \\
+Healthy & 14 & 14.3 & 15.0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Figure~\ref{fig:scatter} plots each repository's bus factor against the share
+of commits written by its top contributor. The two measures are strongly
+related: every repository whose top contributor wrote more than half of all
+commits has a bus factor of~1 by definition, and every Healthy repository has a
+top contributor below 40\%. Popularity offers no protection: \texttt{scrcpy}
+(over 150,000 stars) has a bus factor of~1 with 90.9\% of commits from one
+person, and \texttt{lodash} (over 61,000 stars) has 89.3\%.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.82\textwidth, height=7cm,
+  xlabel={Top contributor's share of commits (\%)},
+  ylabel={Bus factor (log scale)},
+  ymode=log, log basis y=2, ymin=0.8, ymax=64,
+  ytick={1,2,4,8,16,32}, yticklabels={1,2,4,8,16,32},
+  xmin=0, xmax=100, axis lines*=left, grid=major, grid style={gray!20},
+  legend style={at={(0.98,0.98)}, anchor=north east, font=\small, draw=gray!40},
+  tick label style={font=\small}
+]
+\addplot[only marks, mark=*, mark size=2.4pt, color=crit] coordinates {
+ (90.9,1) (72.9,1) (65.5,1) (89.3,1) (54.1,1) (62.5,1) (60.5,1) (79.6,1)
+ (68.2,1) (51.5,1) (90.5,1) (60.3,1) (91.5,1) (66.0,1) (77.3,1) (55.8,1)
+ (96.2,1) (33.3,2) (33.0,2) (44.6,2) (36.2,2) (29.8,3) (22.4,3) (25.4,4)};
+\addplot[only marks, mark=square*, mark size=2.4pt, color=high] coordinates {
+ (32.2,3) (29.0,3) (27.8,3) (26.5,4)};
+\addplot[only marks, mark=triangle*, mark size=3pt, color=healthy] coordinates {
+ (28.1,5) (10.2,6) (19.9,6) (10.3,7) (11.5,8) (12.3,12) (11.8,13) (7.4,14)
+ (9.0,14) (5.3,15) (36.4,18) (27.6,18) (13.8,20) (6.6,44)};
+\legend{Critical, High, Healthy}
+\end{axis}
+\end{tikzpicture}
+\caption{Bus factor versus top-contributor share for the 42 repositories.}
+\label{fig:scatter}
+\end{figure}
+
+Concentration is also uneven across ecosystems (Table~\ref{tab:lang}). The 20
+JavaScript repositories have an average bus factor of 2.8, against 9.9 for the
+8 Python repositories, which reflects the many small single-purpose npm
+packages in the sample. The sample per language is small and was not drawn
+randomly, so this is an observation about this data set, not a general claim.
+
+\begin{table}[H]
+\centering
+\caption{Average bus factor by primary language (languages with $\ge 2$ repositories).}
+\label{tab:lang}
+\small
+\begin{tabular}{lrr}
+\toprule
+\textbf{Language} & \textbf{Repositories} & \textbf{Avg.\ bus factor} \\
+\midrule
+JavaScript & 20 & 2.8 \\
+Python & 8 & 9.9 \\
+TypeScript & 5 & 5.0 \\
+Go & 2 & 15.0 \\
+C & 2 & 3.0 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Effect of the burnout signals}
+
+Across the 42 repositories the signals fired as follows: the top contributor
+was inactive for more than 180 days while holding at least 25\% of commits in
+14 repositories, commit activity fell by 50\% or more in 5, the median issue
+response exceeded 30 days in 2, and 1 repository was archived.
+
+When the burnout signals were introduced, the next sync raised the risk level
+of 9 repositories. The trigger recorded each change in \texttt{risk\_alert}
+without any application code (Table~\ref{tab:alerts}). The same 9 repositories
+are returned by \texttt{CALL sp\_declining\_repos(1)}. These alerts reflect the
+richer scoring rather than a change in the projects themselves. From now on,
+alerts produced by the daily sync will reflect genuine changes.
+
+\begin{table}[H]
+\centering
+\caption{Risk increases recorded by \texttt{trg\_snapshot\_risk\_alert}.}
+\label{tab:alerts}
+\small
+\begin{tabular}{llll}
+\toprule
+\textbf{Repository} & \textbf{Before} & \textbf{After} & \textbf{Main driver} \\
+\midrule
+pallets/flask & High & Critical & top contributor inactive 2,294 days \\
+tj/commander.js & High & Critical & activity $-100\%$ in last 12 weeks \\
+caolan/async & High & Critical & top contributor inactive 775 days \\
+psf/requests & Medium & Critical & activity $-70\%$; top contributor inactive \\
+gulpjs/gulp & Medium & Critical & activity $-100\%$; top contributor inactive \\
+jquery/jquery-mobile & Medium & Critical & repository archived \\
+jashkenas/underscore & Medium & High & top contributor inactive 2,245 days \\
+jquery/jquery & Medium & High & top contributor inactive 5,514 days \\
+mochajs/mocha & Medium & High & top contributor inactive 4,604 days \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Case studies and validation}
+\label{sec:calibration}
+
+Figure~\ref{fig:detail} shows the explanation produced for \texttt{pallets/flask}:
+a bus factor of~2 would normally be High, but the contributor who wrote a third
+of all commits last committed 2,294 days ago, so the level is raised to
+Critical. Several cases act as sanity checks on the method:
+
+\begin{itemize}
+  \item \textbf{Known-healthy projects score Healthy.} React, Node.js, Rust,
+        PyTorch, CPython, Kubernetes and VS Code all have bus factors of 6 or
+        more and no dominant contributor.
+  \item \textbf{Known-unmaintained projects score badly.} The archived
+        \texttt{jquery-mobile} is Critical; \texttt{request} (deprecated by its
+        maintainers in 2020) is High; \texttt{moment} (in maintenance mode) is
+        Critical.
+  \item \textbf{Calibration of the inactivity signal.} In a first version the
+        inactivity signal fired whenever the top contributor had been silent
+        for 180 days. This rated React as Medium, because its all-time top
+        contributor, with only 10.2\% of commits, had not committed for 264
+        days. In a project of that size such turnover is routine, so the
+        signal now requires the inactive person to hold at least 25\% of
+        commits, and React is Healthy again.
+\end{itemize}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\textwidth]{figures/dashboard.jpg}
+\caption{Dashboard: summary counts per risk level and the recent risk
+increases recorded by the trigger.}
+\label{fig:dashboard}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=0.92\textwidth]{figures/repo_detail.jpg}
+\caption{Repository detail for \texttt{pallets/flask}: the risk level with its
+reasons and the burnout signals.}
+\label{fig:detail}
+\end{figure}
+
+\section{Performance}
+
+\paragraph{Sync.} The full sync of 43 repositories took 1,679.7\,s
+(about 39\,s per repository), dominated by GitHub API latency. During the run
+the engine waited on six \texttt{202 Accepted} responses, fell back once to
+deriving weekly totals from contributor statistics, and recovered from six
+dropped connections without losing any repository.
+
+\paragraph{API.} Table~\ref{tab:latency} shows the median latency of each read
+endpoint over 20 requests, measured in-process against the local database. The
+repository-detail endpoint originally took 186\,ms for React (504 contributor
+rows) because its commit-share column used a correlated subquery that
+re-summed the repository's commits for every row. Replacing it with the window
+function \texttt{SUM(total\_commits) OVER ()} computes the total once and
+reduced the latency to 8.6\,ms, about 21 times faster, with identical results.
+
+\begin{table}[H]
+\centering
+\caption{Median API latency over 20 requests.}
+\label{tab:latency}
+\small
+\begin{tabular}{lr}
+\toprule
+\textbf{Endpoint} & \textbf{Median latency} \\
+\midrule
+\texttt{GET /api/repos} (risk-ranked list, via view) & 5.6\,ms \\
+\texttt{GET /api/repos/facebook/react} (before optimisation) & 186.3\,ms \\
+\texttt{GET /api/repos/facebook/react} (window function) & 8.6\,ms \\
+\texttt{GET /api/repos/\{owner\}/\{name\}/trend} & 3.8\,ms \\
+\texttt{GET /api/stats/summary} & 4.3\,ms \\
+\texttt{GET /api/stats/declining} (stored procedure) & 5.4\,ms \\
+\texttt{GET /api/alerts} & 3.6\,ms \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Per-repository results}
+
+Table~\ref{tab:all} lists the latest snapshot for every repository.
+
+\begin{small}
+\setlength{\tabcolsep}{4pt}
+\begin{longtable}{l l r r r r r l}
+\caption{Latest snapshot per repository. BF = bus factor; Top = top
+contributor's share of commits; $\Delta$Act = commit-activity change;
+Inact.\ = days since the top contributor's last commit; ``--'' = not enough
+data.}
+\label{tab:all}\\
+\toprule
+\textbf{Repository} & \textbf{Lang.} & \textbf{Stars} & \textbf{BF} & \textbf{Top \%} & \textbf{$\Delta$Act \%} & \textbf{Inact.} & \textbf{Risk} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Repository} & \textbf{Lang.} & \textbf{Stars} & \textbf{BF} & \textbf{Top \%} & \textbf{$\Delta$Act \%} & \textbf{Inact.} & \textbf{Risk} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+Genymobile/scrcpy & C & 152,325 & 1 & 90.9 & $-4.6$ & 12 & \risk{Critical} \\
+laravel/laravel & Blade & 85,185 & 1 & 72.9 & $-49.3$ & 12 & \risk{Critical} \\
+expressjs/express & JS & 69,572 & 1 & 65.5 & 15.9 & 4,625 & \risk{Critical} \\
+lodash/lodash & JS & 61,288 & 1 & 89.3 & $-84.1$ & 117 & \risk{Critical} \\
+vuejs/core & TS & 54,648 & 1 & 54.1 & 7.0 & 264 & \risk{Critical} \\
+Automattic/mongoose & JS & 27,460 & 1 & 62.5 & $-18.1$ & 5 & \risk{Critical} \\
+chalk/chalk & JS & 23,327 & 1 & 60.5 & 233.3 & 19 & \risk{Critical} \\
+motdotla/dotenv & JS & 20,547 & 1 & 79.6 & 73.8 & 5 & \risk{Critical} \\
+sindresorhus/ky & TS & 17,120 & 1 & 68.2 & 286.4 & 12 & \risk{Critical} \\
+encode/httpx & Python & 15,604 & 1 & 51.5 & $-100.0$ & 397 & \risk{Critical} \\
+BtbN/FFmpeg-Builds & Shell & 11,831 & 1 & 90.5 & 128.2 & 19 & \risk{Critical} \\
+benoitc/gunicorn & Python & 10,701 & 1 & 60.3 & 2.3 & 40 & \risk{Critical} \\
+cordiverse/cordis & TS & 9,212 & 1 & 91.5 & 250.0 & 5 & \risk{Critical} \\
+sindresorhus/execa & JS & 7,619 & 1 & 66.0 & 417.2 & 292 & \risk{Critical} \\
+sindresorhus/p-limit & JS & 2,933 & 1 & 77.3 & 28.2 & 33 & \risk{Critical} \\
+sindresorhus/is-online & JS & 1,357 & 1 & 55.8 & 66.6 & 33 & \risk{Critical} \\
+jonschlinkert/is-number & JS & 286 & 1 & 96.2 & -- & 3,029 & \risk{Critical} \\
+pallets/flask & Python & 74,912 & 2 & 33.3 & $-3.7$ & 2,294 & \risk{Critical} \\
+moment/moment & JS & 47,895 & 2 & 33.0 & 10,900 & 971 & \risk{Critical} \\
+tj/commander.js & JS & 28,423 & 2 & 44.6 & $-100.0$ & 145 & \risk{Critical} \\
+caolan/async & JS & 28,118 & 2 & 36.2 & -- & 775 & \risk{Critical} \\
+psf/requests & Python & 54,461 & 3 & 29.8 & $-69.7$ & 2,581 & \risk{Critical} \\
+jquery/jquery-mobile$^{\dagger}$ & JS & 9,595 & 3 & 22.4 & -- & 3,701 & \risk{Critical} \\
+gulpjs/gulp & JS & 32,921 & 4 & 25.4 & $-100.0$ & 502 & \risk{Critical} \\
+jashkenas/underscore & JS & 27,312 & 3 & 32.2 & $-35.5$ & 2,245 & \risk{High} \\
+request/request & JS & 25,489 & 3 & 29.0 & -- & 2,441 & \risk{High} \\
+mochajs/mocha & JS & 22,902 & 3 & 27.8 & 27.1 & 4,604 & \risk{High} \\
+jquery/jquery & JS & 59,869 & 4 & 26.5 & $-30.1$ & 5,514 & \risk{High} \\
+FFmpeg/FFmpeg & C & 65,277 & 5 & 28.1 & 22.2 & 5 & \risk{Healthy} \\
+facebook/react & JS & 251,163 & 6 & 10.2 & $-7.2$ & 264 & \risk{Healthy} \\
+pypa/pip & Python & 10,293 & 6 & 19.9 & $-49.6$ & 152 & \risk{Healthy} \\
+microsoft/vscode & TS & 193,749 & 7 & 10.3 & 23.6 & 173 & \risk{Healthy} \\
+django/django & Python & 91,401 & 8 & 11.5 & $-29.1$ & 33 & \risk{Healthy} \\
+golang/go & Go & 139,284 & 12 & 12.3 & 19.5 & 54 & \risk{Healthy} \\
+rails/rails & Ruby & 58,841 & 13 & 11.8 & 38.7 & 12 & \risk{Healthy} \\
+nodejs/node & JS & 122,385 & 14 & 7.4 & 100.1 & 5 & \risk{Healthy} \\
+python/cpython & Python & 77,651 & 14 & 9.0 & $-2.1$ & 180 & \risk{Healthy} \\
+angular/angular & TS & 101,062 & 15 & 5.3 & $-25.6$ & 1,433 & \risk{Healthy} \\
+tensorflow/tensorflow & C++ & 201,066 & 18 & 36.4 & 28.2 & 5 & \risk{Healthy} \\
+kubernetes/kubernetes & Go & 128,317 & 18 & 27.6 & $-31.6$ & 124 & \risk{Healthy} \\
+rust-lang/rust & Rust & 120,415 & 20 & 13.8 & 17.9 & 5 & \risk{Healthy} \\
+pytorch/pytorch & Python & 104,804 & 44 & 6.6 & 16.3 & 5 & \risk{Healthy} \\
+\end{longtable}
+\end{small}
+\vspace{-1em}
+\noindent{\footnotesize $^{\dagger}$Archived by its owner.}
+
+\section{Discussion of limitations}
+
+Running the system on real data exposed several limitations, each of which
+points to a concrete improvement:
+
+\begin{itemize}
+  \item \textbf{Automation bots count as contributors.} The top contributors of
+        TensorFlow (\nolinkurl{tensorflower-gardener}, 36.4\%), Kubernetes
+        (\nolinkurl{k8s-ci-robot}, 27.6\%) and PyTorch (\nolinkurl{pytorchmergebot})
+        are bots that merge other people's work. Bots should be excluded before
+        the bus factor is computed.
+  \item \textbf{All-time history over-weights former maintainers.}
+        \texttt{expressjs/express} is Critical because its original author
+        wrote 65.5\% of all commits but last committed 4,625 days ago, even
+        though the project has other active maintainers. A recency-weighted
+        bus factor (e.g.\ over the last 12 months) would capture current
+        concentration better; the inactivity signal only partly compensates.
+  \item \textbf{Commits are a proxy for effort.} Code review, issue triage,
+        releases and documentation are not counted, and squash-merge workflows
+        credit the person who merges.
+  \item \textbf{Truncated contributor lists.} GitHub's contributor statistics
+        cover the top 100 contributors per call. For very large projects the
+        long tail is incomplete, and the stored count grows across syncs as
+        different contributors enter the top 100.
+  \item \textbf{Small baselines.} The activity change is unstable when the
+        baseline is near zero: \texttt{moment} shows $+10{,}900\%$ because a few
+        commits followed a long, almost silent period.
+  \item \textbf{History starts at the first sync.} Trend analysis needs weeks
+        of daily snapshots before \texttt{sp\_declining\_repos(180)} becomes
+        meaningful.
+\end{itemize}
+
+\section{Challenges and lessons learned}
+
+\begin{itemize}
+  \item \textbf{A query that silently returned nothing.} The first trend query
+        joined snapshots on \texttt{s2.computed\_at = s1.computed\_at - INTERVAL
+        6 MONTH}. Snapshots are taken whenever the sync runs, so no two are
+        exactly six months apart to the second, and the query always returned
+        zero rows. It now selects the newest snapshot \emph{at or before} the
+        cut-off. Lesson: test every query on real data, not just for syntax.
+  \item \textbf{Driver behaviour.} The installed MySQL connector returns
+        stored-procedure results as dictionaries, which broke the API's
+        tuple-based handling only once real rows existed. The endpoint now
+        accepts both forms.
+  \item \textbf{Porting from PostgreSQL to MySQL.} The design was first written
+        for PostgreSQL. MySQL needed a different \texttt{INTERVAL} syntax, a
+        window-function median instead of \texttt{PERCENTILE\_CONT}, and a
+        renamed \texttt{release} table.
+  \item \textbf{Calibrating on real data.} The React case above showed that a
+        signal that looks reasonable in isolation can mislabel large projects;
+        thresholds must be checked against known cases.
+\end{itemize}
+
+% ===========================================================================
+\chapter{Conclusion and Future Work}
+\label{ch:conclusion}
+% ===========================================================================
+
+\section{Conclusion}
+
+This project built a working, database-centred system that estimates the bus
+factor and maintainer-burnout risk of real open-source repositories using only
+public GitHub data. The design applies core DBMS concepts where they solve real
+problems: a normalised schema in BCNF with cascading referential integrity,
+one ACID transaction per repository so that a failed sync never corrupts the
+current state, CTEs and window functions that compute the measurements inside
+the database, and a view, stored function, stored procedure and trigger that
+expose current risk, detect declines and record risk increases automatically.
+
+On 42 widely used repositories the system showed that risk is widespread: 40\%
+have a bus factor of~1, including projects with tens of thousands of stars.
+Adding burnout signals raised the risk of 9 repositories, and every change was
+captured by the trigger. Each risk level is explained in plain English. The
+API answers in under 10\,ms, and a single window function made the slowest
+endpoint about 21 times faster.
+
+\section{Future work}
+
+\begin{itemize}
+  \item Filter automation bots and compute a recency-weighted bus factor.
+  \item Count review, triage and release work, not only commits.
+  \item Analyse a project's full dependency tree to report the riskiest
+        dependencies of an application.
+  \item Send e-mail or webhook notifications when a tracked repository becomes
+        Critical.
+  \item Validate the risk levels against a labelled set of projects that were
+        later abandoned.
+\end{itemize}
+
+% ---------------------------------------------------------------------------
+\cleardoublepage
+\phantomsection
+\addcontentsline{toc}{chapter}{References}
+\bibliographystyle{unsrtnat}
+\bibliography{references}
+
+\end{document}
