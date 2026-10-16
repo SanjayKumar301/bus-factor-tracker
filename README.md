@@ -82,11 +82,13 @@ source sql/schema_mysql.sql
 source sql/objects_mysql.sql   -- view, stored function/procedure, trigger
 ```
 
-Already have a database from an older schema? Run the migration once instead
-of the schema file, then the objects file:
+Already have a database from an older schema? Run the migrations you haven't
+run yet (each only once, in order) instead of the schema file, then the
+objects file:
 
 ```sql
 source sql/migrate_001_burnout_signals.sql
+source sql/migrate_002_bots_recency.sql
 source sql/objects_mysql.sql
 ```
 
@@ -134,10 +136,37 @@ npm run dev
 
 ## Risk Scoring
 
-The base level comes from the bus factor:
+Bots (`dependabot[bot]`, `k8s-ci-robot`, `pytorchmergebot`, ...) are excluded
+from every calculation. The base level comes from the bus factor over the
+**last 12 months**. If a repo had fewer than 10 commits in that time, the
+all-time bus factor is used instead.
 
 | Risk Level | Criteria |
 |---|---|
+| 🔴 Critical | Bus factor = 1, or the repo is archived |
+| 🟠 High | Bus factor = 2 |
+| 🟡 Medium | Bus factor 3–4 |
+| 🟢 Healthy | Bus factor 5+ |
+
+Each burnout warning sign then raises it one level (capped at Critical):
+
+| Signal | Threshold |
+|---|---|
+| No recent work | no commits at all in the last 12 months |
+| Slow issue responses | median first reply > 30 days (at least 5 answered issues) |
+| Commit activity decline | last 12 weeks ≥ 50% below the 40 weeks before (only if the earlier period averaged ≥ 1 commit/week) |
+| Top contributor gone quiet | no commit in > 180 days, if they wrote ≥ 25% of commits |
+
+Days since the last release is shown but doesn't change the level. The
+repo page lists the exact reasons behind each score; the thresholds live in
+`assess_risk()` in `scripts/sync_mysql.py`.
+
+The first time a repo is scored with this method, the sync also rebuilds one
+snapshot per month for the past 12 months from GitHub's weekly commit data,
+so trends and `sp_declining_repos` work immediately. Each snapshot records its
+`scoring_version`; snapshots from different versions are never compared.
+
+---|---|
 | 🔴 Critical | Bus factor = 1, or the repo is archived |
 | 🟠 High | Bus factor = 2 |
 | 🟡 Medium | Bus factor 3–4 |

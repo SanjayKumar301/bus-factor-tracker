@@ -454,7 +454,7 @@ a {
 
 .contributor-row {
   display: grid;
-  grid-template-columns: minmax(0, 1.4fr) 100px 60px;
+  grid-template-columns: minmax(0, 1.4fr) 90px 90px 60px;
   align-items: center;
   gap: 16px;
   padding: 10px 0;
@@ -786,6 +786,17 @@ a {
 
 .stat-value.warn {
   color: var(--risk-high);
+}
+
+.bot-tag {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-tertiary);
 }
 
 .alert-list {

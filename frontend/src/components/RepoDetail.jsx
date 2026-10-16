@@ -80,22 +80,24 @@ export default function RepoDetail({ repoRef, onBack }) {
 
       <div className="detail-grid">
         <div className="stat-card">
+          <div className="stat-value">{detail.recent_bus_factor ?? 'n/a'}</div>
+          <div className="stat-label">Bus factor, last 12 months</div>
+        </div>
+        <div className="stat-card">
           <div className="stat-value">{detail.bus_factor ?? '—'}</div>
-          <div className="stat-label">Bus factor</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-value">{detail.top_contributor_pct != null ? `${detail.top_contributor_pct}%` : '—'}</div>
-          <div className="stat-label">Top contributor share</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-value">{detail.active_contributor_count ?? '—'}</div>
-          <div className="stat-label">Active contributors</div>
+          <div className="stat-label">Bus factor, all-time</div>
         </div>
         <div className="stat-card">
           <div className="stat-value">
-            {detail.median_issue_response_hours != null ? `${Math.round(detail.median_issue_response_hours)}h` : 'n/a'}
+            {detail.effective_top_contributor_pct != null ? `${detail.effective_top_contributor_pct}%` : '—'}
           </div>
-          <div className="stat-label">Median issue response</div>
+          <div className="stat-label">
+            Top contributor share{detail.recent_bus_factor != null ? ', last 12 months' : ', all-time'}
+          </div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-value">{detail.active_contributor_count ?? '—'}</div>
+          <div className="stat-label">Active contributors, last 12 months</div>
         </div>
       </div>
 
@@ -134,6 +136,12 @@ export default function RepoDetail({ repoRef, onBack }) {
           </div>
           <div className="stat-label">Since last release</div>
         </div>
+        <div className="stat-card">
+          <div className={`stat-value${detail.median_issue_response_hours > 24 * 30 ? ' warn' : ''}`}>
+            {detail.median_issue_response_hours != null ? `${Math.round(detail.median_issue_response_hours)}h` : 'n/a'}
+          </div>
+          <div className="stat-label">Median issue response</div>
+        </div>
       </div>
 
       {trend && trend.length > 1 && (
@@ -154,7 +162,8 @@ export default function RepoDetail({ repoRef, onBack }) {
                 contentStyle={{ background: '#1a2438', border: '1px solid #253049', borderRadius: 6, fontFamily: 'IBM Plex Mono', fontSize: 12 }}
                 labelFormatter={(v) => new Date(v).toLocaleString()}
               />
-              <Line type="monotone" dataKey="bus_factor" stroke={lineColor} strokeWidth={2} dot={{ r: 3, fill: lineColor }} />
+              {/* effective = last-12-months bus factor where available, else all-time */}
+              <Line type="monotone" dataKey="effective_bus_factor" name="Bus factor" stroke={lineColor} strokeWidth={2} dot={{ r: 3, fill: lineColor }} />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -168,8 +177,8 @@ export default function RepoDetail({ repoRef, onBack }) {
       )}
 
       <div className="panel">
-        <h2 className="section-title">Commit concentration</h2>
-        <ConcentrationBar contributors={detail.contributors} />
+        <h2 className="section-title">Commit concentration (bots excluded)</h2>
+        <ConcentrationBar contributors={detail.contributors.filter((c) => !c.is_bot)} />
       </div>
 
       <div className="panel">
@@ -183,14 +192,21 @@ export default function RepoDetail({ repoRef, onBack }) {
               Commits
             </span>
             <span className="col-label" style={{ fontSize: 11, textTransform: 'uppercase', color: 'var(--text-tertiary)', textAlign: 'right' }}>
+              Last 12 mo
+            </span>
+            <span className="col-label" style={{ fontSize: 11, textTransform: 'uppercase', color: 'var(--text-tertiary)', textAlign: 'right' }}>
               Share
             </span>
           </div>
           {detail.contributors.map((c) => (
             <div key={c.github_username} className="contributor-row">
-              <span className="contributor-name">{c.github_username}</span>
+              <span className="contributor-name">
+                {c.github_username}
+                {c.is_bot && <span className="bot-tag">bot</span>}
+              </span>
               <span className="contributor-commits">{c.total_commits.toLocaleString()}</span>
-              <span className="contributor-pct">{c.commit_share_pct}%</span>
+              <span className="contributor-commits">{c.recent_commits.toLocaleString()}</span>
+              <span className="contributor-pct">{c.commit_share_pct != null ? `${c.commit_share_pct}%` : '—'}</span>
             </div>
           ))}
         </div>

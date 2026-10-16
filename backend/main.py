@@ -81,14 +81,20 @@ class RepoSummary(BaseModel):
     primary_language: Optional[str]
     stars: int
     is_archived: bool
-    bus_factor: Optional[int]
+    bus_factor: Optional[int]                       # all-time, bots excluded
+    recent_bus_factor: Optional[int]                # last 12 months (None if too few recent commits)
+    effective_bus_factor: Optional[int]             # the one the risk level is based on
     top_contributor_pct: Optional[float]
+    recent_top_contributor_pct: Optional[float]
+    effective_top_contributor_pct: Optional[float]
+    recent_commit_count: Optional[int]
     active_contributor_count: Optional[int]
     median_issue_response_hours: Optional[float]
     activity_change_pct: Optional[float]
     top_contributor_days_inactive: Optional[int]
     days_since_last_release: Optional[int]
     risk_level: Optional[str]
+    scoring_version: Optional[int]
     computed_at: Optional[str]
 
 
@@ -108,10 +114,12 @@ class AddRepoRequest(BaseModel):
 
 class ContributorBreakdown(BaseModel):
     github_username: str
+    is_bot: bool
     total_commits: int
+    recent_commits: int                 # last 12 months
     additions: int
     deletions: int
-    commit_share_pct: float
+    commit_share_pct: Optional[float]   # share of human commits; None for bots
 
 
 class RepoDetail(RepoSummary):
@@ -144,6 +152,8 @@ class RiskAlert(BaseModel):
 class SnapshotPoint(BaseModel):
     computed_at: str
     bus_factor: int
+    recent_bus_factor: Optional[int]
+    effective_bus_factor: int
     top_contributor_pct: Optional[float]
     risk_level: str
 
@@ -164,13 +174,16 @@ class DashboardSummary(BaseModel):
 
 SUMMARY_COLUMNS = """
     repo_id, owner, name, primary_language, stars, is_archived,
-    bus_factor, top_contributor_pct, active_contributor_count,
+    bus_factor, recent_bus_factor, effective_bus_factor,
+    top_contributor_pct, recent_top_contributor_pct, effective_top_contributor_pct,
+    recent_commit_count, active_contributor_count,
     median_issue_response_hours, activity_change_pct,
     top_contributor_days_inactive, days_since_last_release,
-    risk_level, computed_at
+    risk_level, scoring_version, computed_at
 """
 
-FLOAT_FIELDS = ("top_contributor_pct", "median_issue_response_hours", "activity_change_pct")
+FLOAT_FIELDS = ("top_contributor_pct", "recent_top_contributor_pct", "effective_top_contributor_pct",
+                "median_issue_response_hours", "activity_change_pct")
 DATE_FIELDS = ("computed_at", "created_at", "then_at", "now_at")
 
 
@@ -208,10 +221,10 @@ def list_repos(
     # fn_risk_rank() is the stored function from sql/objects_mysql.sql
     # (Healthy = 1 ... Critical = 4); repos with no snapshot yet sort last.
     order_clause = {
-        "risk": "fn_risk_rank(risk_level) DESC, bus_factor ASC",
+        "risk": "fn_risk_rank(risk_level) DESC, effective_bus_factor ASC",
         "stars": "stars DESC",
         "name": "owner ASC, name ASC",
-    }.get(sort, "fn_risk_rank(risk_level) DESC, bus_factor ASC")
+    }.get(sort, "fn_risk_rank(risk_level) DESC, effective_bus_factor ASC")
 
     cur.execute(
         f"""
@@ -253,24 +266,37 @@ def get_repo_detail(owner: str, name: str, conn: MySQLConnection = Depends(get_c
         """
         SELECT
             c.github_username,
+            c.is_bot,
             rc.total_commits,
+            COALESCE(recent.commits, 0) AS recent_commits,
             rc.additions,
             rc.deletions,
-            -- Window function: the repo's total is computed once for the
-            -- whole result, not re-summed per row by a correlated subquery.
-            ROUND(100 * rc.total_commits / NULLIF(SUM(rc.total_commits) OVER (), 0), 1) AS commit_share_pct
+            -- Share of human commits. Window function: the repo's human total
+            -- is computed once for the whole result, not re-summed per row.
+            CASE WHEN c.is_bot THEN NULL ELSE ROUND(100 * rc.total_commits / NULLIF(
+                SUM(CASE WHEN c.is_bot THEN 0 ELSE rc.total_commits END) OVER (), 0), 1)
+            END AS commit_share_pct
         FROM repo_contributor rc
         JOIN contributor c ON c.contributor_id = rc.contributor_id
+        LEFT JOIN (
+            SELECT contributor_id, SUM(commits) AS commits
+            FROM contributor_weekly_commits
+            WHERE repo_id = %s AND week_start > CURDATE() - INTERVAL 52 WEEK
+            GROUP BY contributor_id
+        ) recent ON recent.contributor_id = rc.contributor_id
         WHERE rc.repo_id = %s
         ORDER BY rc.total_commits DESC
         """,
-        (repo["repo_id"],),
+        (repo["repo_id"], repo["repo_id"]),
     )
     contributors = cur.fetchall()
     cur.close()
 
     for c in contributors:
-        c["commit_share_pct"] = float(c["commit_share_pct"]) if c["commit_share_pct"] is not None else 0.0
+        c["is_bot"] = bool(c["is_bot"])
+        c["recent_commits"] = int(c["recent_commits"])
+        if c["commit_share_pct"] is not None:
+            c["commit_share_pct"] = float(c["commit_share_pct"])
 
     to_json_types(repo)
 
@@ -281,6 +307,9 @@ def get_repo_detail(owner: str, name: str, conn: MySQLConnection = Depends(get_c
         _, repo["risk_drivers"] = assess_risk(
             bus_factor=repo["bus_factor"],
             top_contributor_pct=repo["top_contributor_pct"],
+            recent_bus_factor=repo["recent_bus_factor"],
+            recent_top_contributor_pct=repo["recent_top_contributor_pct"],
+            recent_commit_count=repo["recent_commit_count"],
             median_issue_response_hours=repo["median_issue_response_hours"],
             activity_change_pct=repo["activity_change_pct"],
             top_contributor_days_inactive=repo["top_contributor_days_inactive"],
@@ -295,18 +324,33 @@ def get_repo_detail(owner: str, name: str, conn: MySQLConnection = Depends(get_c
 @app.get("/api/repos/{owner}/{name}/trend", response_model=list[SnapshotPoint])
 def get_repo_trend(owner: str, name: str, conn: MySQLConnection = Depends(get_connection)):
     """
-    Full snapshot history for one repo — powers the "bus factor over time"
-    trend chart. Only meaningful once sync_mysql.py has been run more than
-    once for this repo (each run adds one snapshot row).
+    Snapshot history for one repo — powers the "bus factor over time" trend
+    chart. Only snapshots of the repo's newest scoring version are returned,
+    so a change of method never shows up as a jump in the chart. Includes the
+    monthly snapshots back-filled on the repo's first sync with that version.
     """
     cur = conn.cursor(dictionary=True)
+    # One point per day: if a repo was synced several times in a day, keep
+    # the day's latest snapshot (ROW_NUMBER() over each calendar day).
     cur.execute(
         """
-        SELECT s.computed_at, s.bus_factor, s.top_contributor_pct, s.risk_level
-        FROM bus_factor_snapshot s
-        JOIN repository r ON r.repo_id = s.repo_id
-        WHERE r.owner = %s AND r.name = %s
-        ORDER BY s.computed_at ASC
+        WITH versioned AS (
+            SELECT s.*,
+                   ROW_NUMBER() OVER (PARTITION BY DATE(s.computed_at)
+                                      ORDER BY s.computed_at DESC, s.snapshot_id DESC) AS nth_today
+            FROM bus_factor_snapshot s
+            JOIN repository r ON r.repo_id = s.repo_id
+            WHERE r.owner = %s AND r.name = %s
+              AND s.scoring_version = (
+                  SELECT MAX(s2.scoring_version) FROM bus_factor_snapshot s2 WHERE s2.repo_id = r.repo_id
+              )
+        )
+        SELECT computed_at, bus_factor, recent_bus_factor,
+               COALESCE(recent_bus_factor, bus_factor) AS effective_bus_factor,
+               top_contributor_pct, risk_level
+        FROM versioned
+        WHERE nth_today = 1
+        ORDER BY computed_at ASC
         """,
         (owner, name),
     )
@@ -391,6 +435,12 @@ def get_alerts(
         SELECT a.alert_id, r.owner, r.name, a.previous_level, a.new_level, a.created_at
         FROM risk_alert a
         JOIN repository r ON r.repo_id = a.repo_id
+        JOIN bus_factor_snapshot s ON s.snapshot_id = a.snapshot_id
+        -- Only alerts from the repo's current scoring version: alerts from an
+        -- older method are history of the method, not of the project.
+        WHERE s.scoring_version = (
+            SELECT MAX(s2.scoring_version) FROM bus_factor_snapshot s2 WHERE s2.repo_id = a.repo_id
+        )
         ORDER BY a.created_at DESC, a.alert_id DESC
         LIMIT %s
         """,

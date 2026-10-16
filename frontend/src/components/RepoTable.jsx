@@ -51,9 +51,9 @@ export default function RepoTable({ repos, activeFilter, onFilterChange, onSelec
                 {repo.is_archived ? ' · archived' : ''}
               </div>
             </div>
-            <div className="bus-factor-cell">{repo.bus_factor ?? '—'}</div>
+            <div className="bus-factor-cell">{repo.effective_bus_factor ?? '—'}</div>
             <div className="concentration-col">
-              <MiniConcentrationBar topContributorPct={repo.top_contributor_pct} riskLevel={repo.risk_level} />
+              <MiniConcentrationBar topContributorPct={repo.effective_top_contributor_pct} riskLevel={repo.risk_level} />
             </div>
             <div className="repo-row-end">
               <RiskBadge level={repo.risk_level} />

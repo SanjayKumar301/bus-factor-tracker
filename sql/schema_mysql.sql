@@ -21,7 +21,8 @@ CREATE TABLE repository (
 CREATE TABLE contributor (
     contributor_id             INT AUTO_INCREMENT PRIMARY KEY,
     github_username            VARCHAR(255) NOT NULL UNIQUE,
-    github_account_created_at  DATE
+    github_account_created_at  DATE,
+    is_bot                     BOOLEAN NOT NULL DEFAULT FALSE  -- excluded from bus factor / activity
 ) ENGINE=InnoDB;
 
 CREATE TABLE repo_contributor (
@@ -33,6 +34,19 @@ CREATE TABLE repo_contributor (
     first_commit_at  DATE,
     last_commit_at   DATE,
     PRIMARY KEY (repo_id, contributor_id),
+    FOREIGN KEY (repo_id) REFERENCES repository(repo_id) ON DELETE CASCADE,
+    FOREIGN KEY (contributor_id) REFERENCES contributor(contributor_id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
+-- Commits per contributor per week (weeks with at least one commit only),
+-- from GitHub's stats/contributors breakdown. Lets the bus factor be computed
+-- for any time window and as of any past date (history backfill).
+CREATE TABLE contributor_weekly_commits (
+    repo_id         INT NOT NULL,
+    contributor_id  INT NOT NULL,
+    week_start      DATE NOT NULL,
+    commits         INT NOT NULL,
+    PRIMARY KEY (repo_id, contributor_id, week_start),
     FOREIGN KEY (repo_id) REFERENCES repository(repo_id) ON DELETE CASCADE,
     FOREIGN KEY (contributor_id) REFERENCES contributor(contributor_id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
@@ -84,8 +98,11 @@ CREATE TABLE bus_factor_snapshot (
     snapshot_id                  INT AUTO_INCREMENT PRIMARY KEY,
     repo_id                      INT NOT NULL,
     computed_at                  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    bus_factor                   INT NOT NULL,
+    bus_factor                   INT NOT NULL,             -- all-time, bots excluded (v2)
+    recent_bus_factor            INT,                      -- last 52 weeks, bots excluded
     top_contributor_pct          FLOAT,
+    recent_top_contributor_pct   FLOAT,
+    recent_commit_count          INT,
     active_contributor_count     INT,
     median_issue_response_hours  FLOAT,
     -- burnout signals (see compute_and_insert_snapshot in sync_mysql.py)
@@ -93,6 +110,7 @@ CREATE TABLE bus_factor_snapshot (
     top_contributor_days_inactive  INT,     -- days since the top contributor's last commit
     days_since_last_release        INT,
     risk_level                   ENUM('Critical', 'High', 'Medium', 'Healthy'),
+    scoring_version              TINYINT NOT NULL DEFAULT 1, -- snapshots are only compared within a version
     FOREIGN KEY (repo_id) REFERENCES repository(repo_id) ON DELETE CASCADE
 ) ENGINE=InnoDB;
 
@@ -115,6 +133,8 @@ CREATE INDEX idx_repo_contributor_repo ON repo_contributor(repo_id);
 CREATE INDEX idx_issue_repo ON issue(repo_id);
 CREATE INDEX idx_snapshot_repo_time ON bus_factor_snapshot(repo_id, computed_at);
 CREATE INDEX idx_risk_alert_time ON risk_alert(created_at);
+CREATE INDEX idx_snapshot_repo_version_time ON bus_factor_snapshot(repo_id, scoring_version, computed_at);
+CREATE INDEX idx_cwc_repo_week ON contributor_weekly_commits(repo_id, week_start);
 
 -- Views, the stored function/procedure and the trigger live in
 -- sql/objects_mysql.sql — run that file after this one.

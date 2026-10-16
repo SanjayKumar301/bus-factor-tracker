@@ -22,11 +22,12 @@ Run:
 """
 
 import os
+import re
 import time
 from pathlib import Path
 import requests
 import mysql.connector
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
@@ -239,17 +240,24 @@ def fetch_releases(owner, repo, since=None):
     return get_paginated(url, max_pages=2, stop_before=since, updated_field="published_at")
 
 
-def fetch_first_response_at(owner, repo, issue_number):
+def fetch_first_response_at(owner, repo, issue_number, author_login=None):
     """
     GitHub doesn't give first-response time directly — it has to be derived
-    from the first comment on an issue. One extra API call per issue, so
-    this is deliberately only used for a capped, recent subset of issues
-    (see MAX_ISSUES_FOR_RESPONSE_TIME below) to keep rate-limit usage sane.
+    from the comments on an issue. One extra API call per issue, so this is
+    deliberately only used for a capped, recent subset of issues (see
+    MAX_ISSUES_FOR_RESPONSE_TIME below) to keep rate-limit usage sane.
+
+    The response is the first comment from a person other than the issue's
+    author: many projects have bots that comment on every new issue within
+    seconds (gopherbot, k8s-ci-robot), which would otherwise make every
+    project look instantly responsive.
     """
-    url = f"{API_ROOT}/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=1"
-    comments = get_json(url)
-    if comments:
-        return comments[0]["created_at"]
+    url = f"{API_ROOT}/repos/{owner}/{repo}/issues/{issue_number}/comments?per_page=30"
+    for comment in get_json(url) or []:
+        user = comment.get("user") or {}
+        login = user.get("login", "")
+        if login and login != author_login and not is_bot_account(login, user.get("type")):
+            return comment["created_at"]
     return None
 
 
@@ -295,17 +303,47 @@ def upsert_repo(cur, owner, repo, meta):
     return cur.fetchone()[0]
 
 
-def upsert_contributor(cur, username):
+# Automation accounts that commit or merge on a project's behalf. GitHub
+# marks GitHub Apps with type "Bot" ("dependabot[bot]"), but many CI bots are
+# ordinary user accounts ("k8s-ci-robot", "pytorchmergebot",
+# "tensorflower-gardener"), so their names are matched too. Checked against
+# all 17,306 contributors in the evaluation data: the few human-looking
+# matches have 60 commits or fewer, too few to affect any bus factor.
+BOT_LOGIN_RE = re.compile(r"(\[bot\]|bot|-gardener)$", re.IGNORECASE)
+
+
+def is_bot_account(login, account_type=None):
+    return account_type == "Bot" or bool(BOT_LOGIN_RE.search(login))
+
+
+def upsert_contributor(cur, username, account_type=None):
     cur.execute(
         """
-        INSERT INTO contributor (github_username)
-        VALUES (%s)
-        ON DUPLICATE KEY UPDATE github_username = VALUES(github_username)
+        INSERT INTO contributor (github_username, is_bot)
+        VALUES (%s, %s)
+        ON DUPLICATE KEY UPDATE is_bot = VALUES(is_bot)
         """,
-        (username,),
+        (username, is_bot_account(username, account_type)),
     )
     cur.execute("SELECT contributor_id FROM contributor WHERE github_username = %s", (username,))
     return cur.fetchone()[0]
+
+
+def upsert_contributor_weeks(cur, repo_id, contributor_id, weeks):
+    """Store this contributor's commits per week (weeks with commits only)."""
+    rows = [
+        (repo_id, contributor_id, time.strftime("%Y-%m-%d", time.gmtime(w["w"])), w["c"])
+        for w in weeks if w.get("c", 0) > 0
+    ]
+    if rows:
+        cur.executemany(
+            """
+            INSERT INTO contributor_weekly_commits (repo_id, contributor_id, week_start, commits)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE commits = VALUES(commits)
+            """,
+            rows,
+        )
 
 
 def upsert_repo_contributor(cur, repo_id, contributor_id, total_commits, additions, deletions,
@@ -413,35 +451,69 @@ STALE_RELEASE_DAYS = 365             # informational only — many healthy repos
 
 RISK_LEVELS = ["Healthy", "Medium", "High", "Critical"]
 
+# Version 2 of the scoring method: bots excluded, bus factor measured over
+# the last 12 months when there is enough recent work, history back-filled.
+# Stored on every snapshot so old and new methods are never compared.
+SCORING_VERSION = 2
+RECENT_WEEKS = 52                    # "recent" = the last 12 months
+RECENT_MIN_COMMITS = 10              # fewer recent commits -> fall back to the all-time bus factor
+MIN_BASELINE_COMMITS_PER_WEEK = 1.0  # below this, an activity change in % is just noise
+MIN_RESPONSE_SAMPLES = 5             # fewer answered issues -> no median response time
+HISTORY_MONTHS = 12                  # monthly snapshots back-filled for a repo's first v2 sync
 
-def assess_risk(bus_factor, top_contributor_pct, median_issue_response_hours, activity_change_pct,
+
+def _level_for_bus_factor(bus_factor):
+    if bus_factor == 1:
+        return 3
+    if bus_factor == 2:
+        return 2
+    if bus_factor <= 4:
+        return 1
+    return 0
+
+
+def assess_risk(bus_factor, top_contributor_pct, recent_bus_factor, recent_top_contributor_pct,
+                recent_commit_count, median_issue_response_hours, activity_change_pct,
                 top_contributor_days_inactive, days_since_last_release, is_archived):
     """
     Returns (risk_level, drivers) where drivers is a list of plain-English
-    reasons. Bus factor sets the base level; each independent burnout
-    warning sign bumps it up one level (capped at Critical). An archived
-    repo is Critical outright — its maintainers have said so.
+    reasons. The bus factor sets the base level: the last-12-months value
+    when the repo had enough recent commits (recent_bus_factor is set),
+    otherwise the all-time value. Each independent burnout warning sign
+    bumps the level up by one (capped at Critical). An archived repo is
+    Critical outright — its maintainers have said so.
     """
     drivers = []
+    use_recent = recent_bus_factor is not None
+    bf = recent_bus_factor if use_recent else bus_factor
+    share = recent_top_contributor_pct if use_recent else top_contributor_pct
+    share_text = f" (top contributor: {share:g}% of commits)" if share is not None else ""
 
-    if bus_factor == 1:
-        level = 3
-    elif bus_factor == 2:
-        level = 2
-    elif bus_factor <= 4:
-        level = 1
+    level = _level_for_bus_factor(bf)
+    if use_recent:
+        if bf <= 2:
+            people = "1 person wrote" if bf == 1 else f"{bf} people wrote"
+            drivers.append(f"Bus factor {bf} over the last 12 months: {people} at least half "
+                           f"of recent commits{share_text}")
+        else:
+            drivers.append(f"Bus factor {bf} over the last 12 months: recent work is spread "
+                           f"across several people{share_text}")
+        if bus_factor is not None and bus_factor != bf:
+            drivers.append(f"All-time bus factor is {bus_factor}; the rating uses recent activity")
+    elif recent_commit_count is None:
+        # Snapshot from scoring version 1, which only measured all-time commits.
+        drivers.append(f"Bus factor {bf} (all-time){share_text}")
     else:
-        level = 0
-    share = f" (top contributor: {top_contributor_pct:g}% of commits)" if top_contributor_pct is not None else ""
-    if bus_factor <= 2:
-        people = "1 person wrote" if bus_factor == 1 else f"{bus_factor} people wrote"
-        drivers.append(f"Bus factor {bus_factor}: {people} at least half of all commits{share}")
-    else:
-        drivers.append(f"Bus factor {bus_factor}: work is spread across several people{share}")
+        drivers.append(f"Bus factor {bf} (all-time — too few commits in the last 12 months "
+                       f"to measure recent activity){share_text}")
 
     if is_archived:
         level = 3
         drivers.insert(0, "Repository is archived by its owner — no longer maintained")
+
+    if recent_commit_count == 0:
+        level += 1
+        drivers.append("No commits in the last 12 months")
 
     if median_issue_response_hours is not None and median_issue_response_hours > SLOW_RESPONSE_HOURS:
         level += 1
@@ -451,15 +523,14 @@ def assess_risk(bus_factor, top_contributor_pct, median_issue_response_hours, ac
         level += 1
         drivers.append(f"Commit activity down {abs(activity_change_pct):.0f}% in the last 12 weeks vs the 40 before")
 
-    # In a large project the all-time top contributor may have written only
-    # ~10% of the code, and their leaving is routine turnover, not a risk.
-    # It only signals burnout when the project actually leans on that person.
+    # Turnover is routine in large projects; inactivity only signals burnout
+    # when the project actually leans on that person.
     if (top_contributor_days_inactive is not None
             and top_contributor_days_inactive > MAINTAINER_INACTIVE_DAYS
-            and top_contributor_pct is not None
-            and top_contributor_pct >= KEY_MAINTAINER_PCT):
+            and share is not None
+            and share >= KEY_MAINTAINER_PCT):
         level += 1
-        drivers.append(f"Top contributor ({top_contributor_pct:g}% of commits) has not committed in "
+        drivers.append(f"Top contributor ({share:g}% of commits) has not committed in "
                        f"{top_contributor_days_inactive} days")
 
     if days_since_last_release is not None and days_since_last_release > STALE_RELEASE_DAYS:
@@ -468,53 +539,108 @@ def assess_risk(bus_factor, top_contributor_pct, median_issue_response_hours, ac
     return RISK_LEVELS[min(level, 3)], drivers
 
 
-def compute_and_insert_snapshot(cur, repo_id):
+# Bus factor over a time window, bots excluded. Contributors are ranked by
+# commits in the window (ties broken by id so the running total is strictly
+# cumulative); the bus factor is the smallest rank whose running total
+# reaches half of all commits in the window.
+BUS_FACTOR_WINDOW_SQL = """
+    WITH per_person AS (
+        SELECT w.contributor_id, SUM(w.commits) AS commits
+        FROM contributor_weekly_commits w
+        JOIN contributor c ON c.contributor_id = w.contributor_id
+        WHERE w.repo_id = %s
+          AND c.is_bot = FALSE
+          AND w.week_start > %s
+          AND w.week_start <= %s
+        GROUP BY w.contributor_id
+    ),
+    ranked AS (
+        SELECT
+            contributor_id,
+            commits,
+            SUM(commits) OVER ()                                       AS total,
+            SUM(commits) OVER (ORDER BY commits DESC, contributor_id)  AS running_total,
+            ROW_NUMBER() OVER (ORDER BY commits DESC, contributor_id)  AS contributor_rank,
+            COUNT(*)     OVER ()                                       AS people
+        FROM per_person
+    )
+    SELECT
+        MIN(CASE WHEN running_total >= 0.5 * total THEN contributor_rank END),
+        MAX(CASE WHEN contributor_rank = 1 THEN ROUND(100 * commits / total, 1) END),
+        MAX(CASE WHEN contributor_rank = 1 THEN contributor_id END),
+        MAX(total),
+        MAX(people)
+    FROM ranked
+"""
+
+
+def bus_factor_window(cur, repo_id, after, until):
+    """Bus factor of commits in weeks (after, until]; None if there are none."""
+    cur.execute(BUS_FACTOR_WINDOW_SQL, (repo_id, after, until))
+    bf, top_pct, top_id, total, people = cur.fetchone()
+    if bf is None or not total:
+        return None
+    return {
+        "bus_factor": int(bf),
+        "top_pct": float(top_pct),
+        "top_contributor_id": int(top_id),
+        "commits": int(total),
+        "people": int(people),
+    }
+
+
+def compute_metrics(cur, repo_id, as_of, is_current):
     """
-    Phase 4: bus factor, top-contributor %, active contributor count, and
-    median issue response time are now all computed with SQL window
-    functions (MySQL 8.0+), not Python loops. This is the version worth
-    showing off in your report — it demonstrates CTEs, SUM() OVER(),
-    ROW_NUMBER() OVER(), and a window-function-based median, all of which
-    map directly to Section 6 of the project guide.
+    Every measurement a snapshot needs, as of the date `as_of` — so the same
+    code produces today's snapshot and the back-filled history. Returns None
+    if the repo had no (non-bot) commits yet at that date.
     """
-    # --- Bus factor + top contributor % + active contributor count ---
-    # Single CTE query: rank contributors by commits, build a running total,
-    # and find the smallest rank at which the running total crosses 50% of
-    # all commits to this repo. No PARTITION BY needed here (unlike the
-    # multi-repo version in queries_mysql.sql) because we already scope to
-    # one repo_id via WHERE — every row belongs to the same repo.
+    next_day = as_of + timedelta(days=1)
+
+    all_time = bus_factor_window(cur, repo_id, date(1970, 1, 1), as_of)
+    if all_time is None:
+        return None
+    recent = bus_factor_window(cur, repo_id, as_of - timedelta(weeks=RECENT_WEEKS), as_of)
+    recent_commits = recent["commits"] if recent else 0
+    use_recent = recent is not None and recent_commits >= RECENT_MIN_COMMITS
+    basis = recent if use_recent else all_time
+
+    # Days since the (basis) top contributor's last commit week.
     cur.execute(
         """
-        WITH ranked_contributors AS (
-            SELECT
-                contributor_id,
-                total_commits,
-                SUM(total_commits) OVER () AS repo_total_commits,
-                SUM(total_commits) OVER (ORDER BY total_commits DESC) AS running_total,
-                ROW_NUMBER() OVER (ORDER BY total_commits DESC) AS contributor_rank,
-                COUNT(*) OVER () AS active_contributor_count
-            FROM repo_contributor
-            WHERE repo_id = %s
-        )
-        SELECT
-            MIN(CASE WHEN running_total >= 0.5 * repo_total_commits THEN contributor_rank END) AS bus_factor,
-            MAX(CASE WHEN contributor_rank = 1 THEN ROUND(100 * total_commits / repo_total_commits, 1) END) AS top_contributor_pct,
-            MAX(active_contributor_count) AS active_contributor_count
-        FROM ranked_contributors
+        SELECT DATEDIFF(%s, MAX(week_start))
+        FROM contributor_weekly_commits
+        WHERE repo_id = %s AND contributor_id = %s AND week_start <= %s
         """,
-        (repo_id,),
+        (as_of, repo_id, basis["top_contributor_id"], as_of),
     )
-    row = cur.fetchone()
-    if row is None or row[0] is None:
-        return  # no contributor data yet for this repo
-    bus_factor = int(row[0])
-    top_contributor_pct = float(row[1]) if row[1] is not None else None
-    active_contributor_count = int(row[2])
+    top_contributor_days_inactive = cur.fetchone()[0]
 
-    # --- Median issue first-response time ---
-    # MySQL's PERCENTILE_CONT() only exists from 8.0.28 onward, so this uses
-    # the portable ROW_NUMBER()-based median instead (works on any MySQL 8.0+):
-    # rank response times, then average the middle one or two (for even counts).
+    # Commit activity (bots excluded): average commits per week in the last
+    # 12 weeks vs the 40 weeks before. Weeks without commits have no row, so
+    # sums are divided by the number of weeks, not averaged over rows.
+    cur.execute(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN w.week_start >  %s - INTERVAL 12 WEEK THEN w.commits END), 0),
+            COALESCE(SUM(CASE WHEN w.week_start <= %s - INTERVAL 12 WEEK THEN w.commits END), 0)
+        FROM contributor_weekly_commits w
+        JOIN contributor c ON c.contributor_id = w.contributor_id
+        WHERE w.repo_id = %s
+          AND c.is_bot = FALSE
+          AND w.week_start <= %s
+          AND w.week_start >  %s - INTERVAL 52 WEEK
+        """,
+        (as_of, as_of, repo_id, as_of, as_of),
+    )
+    last_12, previous_40 = cur.fetchone()
+    recent_avg, baseline_avg = float(last_12) / 12, float(previous_40) / 40
+    activity_change_pct = None
+    if baseline_avg >= MIN_BASELINE_COMMITS_PER_WEEK:
+        activity_change_pct = round(100 * (recent_avg - baseline_avg) / baseline_avg, 1)
+
+    # Median time to first response for issues opened in the 12 months
+    # before as_of (window-function median; PERCENTILE_CONT needs 8.0.28+).
     cur.execute(
         """
         WITH ranked AS (
@@ -523,92 +649,130 @@ def compute_and_insert_snapshot(cur, repo_id):
                 ROW_NUMBER() OVER (ORDER BY TIMESTAMPDIFF(HOUR, created_at, first_response_at)) AS rn,
                 COUNT(*) OVER () AS cnt
             FROM issue
-            WHERE repo_id = %s AND first_response_at IS NOT NULL
+            WHERE repo_id = %s
+              AND first_response_at IS NOT NULL
+              AND first_response_at < %s
+              AND created_at >= %s - INTERVAL 365 DAY
         )
-        SELECT AVG(response_hours) AS median_response_hours
+        SELECT AVG(response_hours), MAX(cnt)
         FROM ranked
         WHERE rn IN (FLOOR((cnt + 1) / 2), CEIL((cnt + 1) / 2))
         """,
-        (repo_id,),
+        (repo_id, next_day, next_day),
     )
-    median_row = cur.fetchone()
-    median_issue_response_hours = float(median_row[0]) if median_row and median_row[0] is not None else None
-
-    # --- Burnout signals ---
-    # Commit activity trend: average commits/week over the last 12 weeks vs
-    # the 40 weeks before that, measured from the repo's newest week of data.
-    # A sharp drop means the people doing the work are slowing down — the
-    # earliest visible sign of a maintainer burning out or drifting away.
-    cur.execute(
-        """
-        SELECT
-            AVG(CASE WHEN w.week_start >  m.latest_week - INTERVAL 12 WEEK
-                     THEN w.commit_count END) AS recent_avg,
-            AVG(CASE WHEN w.week_start <= m.latest_week - INTERVAL 12 WEEK
-                      AND w.week_start >  m.latest_week - INTERVAL 52 WEEK
-                     THEN w.commit_count END) AS baseline_avg
-        FROM weekly_activity w
-        JOIN (SELECT MAX(week_start) AS latest_week FROM weekly_activity WHERE repo_id = %s) m
-        WHERE w.repo_id = %s
-        """,
-        (repo_id, repo_id),
-    )
-    recent_avg, baseline_avg = cur.fetchone()
-    activity_change_pct = None
-    if recent_avg is not None and baseline_avg:  # baseline of 0 / NULL -> no meaningful %
-        activity_change_pct = round(100 * (float(recent_avg) - float(baseline_avg)) / float(baseline_avg), 1)
-
-    # How long since the single biggest contributor last committed? If the
-    # person the project depends on most has gone quiet, the bus factor
-    # number is about to become a real outage.
-    cur.execute(
-        """
-        SELECT DATEDIFF(CURDATE(), last_commit_at)
-        FROM repo_contributor
-        WHERE repo_id = %s
-        ORDER BY total_commits DESC
-        LIMIT 1
-        """,
-        (repo_id,),
-    )
-    inactive_row = cur.fetchone()
-    top_contributor_days_inactive = int(inactive_row[0]) if inactive_row and inactive_row[0] is not None else None
+    median_hours, samples = cur.fetchone()
+    median_issue_response_hours = None
+    if median_hours is not None and samples >= MIN_RESPONSE_SAMPLES:
+        median_issue_response_hours = float(median_hours)
 
     cur.execute(
-        "SELECT DATEDIFF(CURDATE(), MAX(published_at)) FROM repo_release WHERE repo_id = %s",
-        (repo_id,),
+        "SELECT DATEDIFF(%s, MAX(published_at)) FROM repo_release WHERE repo_id = %s AND published_at < %s",
+        (as_of, repo_id, next_day),
     )
-    release_row = cur.fetchone()
-    days_since_last_release = int(release_row[0]) if release_row and release_row[0] is not None else None
+    days_since_last_release = cur.fetchone()[0]
 
-    cur.execute("SELECT is_archived FROM repository WHERE repo_id = %s", (repo_id,))
-    is_archived = bool(cur.fetchone()[0])
+    # Only the current state of the archived flag is known.
+    is_archived = False
+    if is_current:
+        cur.execute("SELECT is_archived FROM repository WHERE repo_id = %s", (repo_id,))
+        is_archived = bool(cur.fetchone()[0])
 
+    return {
+        "bus_factor": all_time["bus_factor"],
+        "top_contributor_pct": all_time["top_pct"],
+        "recent_bus_factor": recent["bus_factor"] if use_recent else None,
+        "recent_top_contributor_pct": recent["top_pct"] if use_recent else None,
+        "recent_commit_count": recent_commits,
+        "active_contributor_count": recent["people"] if recent else 0,
+        "median_issue_response_hours": median_issue_response_hours,
+        "activity_change_pct": activity_change_pct,
+        "top_contributor_days_inactive": top_contributor_days_inactive,
+        "days_since_last_release": days_since_last_release,
+        "is_archived": is_archived,
+    }
+
+
+def insert_snapshot(cur, repo_id, metrics, computed_at):
+    """Score the metrics and store them as one snapshot (fires the alert trigger)."""
     risk_level, _ = assess_risk(
-        bus_factor=bus_factor,
-        top_contributor_pct=top_contributor_pct,
-        median_issue_response_hours=median_issue_response_hours,
-        activity_change_pct=activity_change_pct,
-        top_contributor_days_inactive=top_contributor_days_inactive,
-        days_since_last_release=days_since_last_release,
-        is_archived=is_archived,
+        bus_factor=metrics["bus_factor"],
+        top_contributor_pct=metrics["top_contributor_pct"],
+        recent_bus_factor=metrics["recent_bus_factor"],
+        recent_top_contributor_pct=metrics["recent_top_contributor_pct"],
+        recent_commit_count=metrics["recent_commit_count"],
+        median_issue_response_hours=metrics["median_issue_response_hours"],
+        activity_change_pct=metrics["activity_change_pct"],
+        top_contributor_days_inactive=metrics["top_contributor_days_inactive"],
+        days_since_last_release=metrics["days_since_last_release"],
+        is_archived=metrics["is_archived"],
     )
-
     cur.execute(
         """
         INSERT INTO bus_factor_snapshot
-            (repo_id, bus_factor, top_contributor_pct, active_contributor_count,
-             median_issue_response_hours, activity_change_pct,
-             top_contributor_days_inactive, days_since_last_release, risk_level)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (repo_id, computed_at, bus_factor, recent_bus_factor, top_contributor_pct,
+             recent_top_contributor_pct, recent_commit_count, active_contributor_count,
+             median_issue_response_hours, activity_change_pct, top_contributor_days_inactive,
+             days_since_last_release, risk_level, scoring_version)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
-        (repo_id, bus_factor, top_contributor_pct, active_contributor_count,
-         median_issue_response_hours, activity_change_pct,
-         top_contributor_days_inactive, days_since_last_release, risk_level),
+        (repo_id, computed_at, metrics["bus_factor"], metrics["recent_bus_factor"],
+         metrics["top_contributor_pct"], metrics["recent_top_contributor_pct"],
+         metrics["recent_commit_count"], metrics["active_contributor_count"],
+         metrics["median_issue_response_hours"], metrics["activity_change_pct"],
+         metrics["top_contributor_days_inactive"], metrics["days_since_last_release"],
+         risk_level, SCORING_VERSION),
     )
-    median_str = f"{median_issue_response_hours:.0f}h" if median_issue_response_hours is not None else "n/a"
-    print(f"    -> bus_factor={bus_factor}  risk={risk_level}  top_contributor={top_contributor_pct}%  median_response={median_str}"
-          f"  activity_change={activity_change_pct}%  top_inactive_days={top_contributor_days_inactive}")
+    return risk_level
+
+
+def month_start(day, months_back):
+    """First day of the month `months_back` months before `day`'s month."""
+    year, month = day.year, day.month - months_back
+    while month <= 0:
+        month += 12
+        year -= 1
+    return date(year, month, 1)
+
+
+def backfill_history(cur, repo_id, today):
+    """
+    The first time a repo is scored with the current method, rebuild one
+    snapshot per month for the past HISTORY_MONTHS months from the stored
+    weekly commit data, so trends exist immediately instead of only after
+    months of daily syncs. Inserted oldest first.
+    """
+    cur.execute(
+        "SELECT 1 FROM bus_factor_snapshot WHERE repo_id = %s AND scoring_version = %s LIMIT 1",
+        (repo_id, SCORING_VERSION),
+    )
+    if cur.fetchone():
+        return 0
+    inserted = 0
+    for months_back in range(HISTORY_MONTHS - 1, -1, -1):
+        as_of = month_start(today, months_back)
+        if as_of >= today:
+            continue
+        metrics = compute_metrics(cur, repo_id, as_of, is_current=False)
+        if metrics is not None:
+            insert_snapshot(cur, repo_id, metrics, datetime.combine(as_of, datetime.min.time()))
+            inserted += 1
+    return inserted
+
+
+def compute_and_insert_snapshot(cur, repo_id):
+    """Back-fill history if needed, then store today's snapshot."""
+    today = date.today()
+    backfilled = backfill_history(cur, repo_id, today)
+    metrics = compute_metrics(cur, repo_id, today, is_current=True)
+    if metrics is None:
+        return  # no commit data for this repo yet
+    risk_level = insert_snapshot(cur, repo_id, metrics, datetime.now().replace(microsecond=0))
+
+    recent = metrics["recent_bus_factor"]
+    print(f"    -> bus_factor={metrics['bus_factor']}  recent={recent if recent is not None else 'n/a'}"
+          f"  risk={risk_level}  activity_change={metrics['activity_change_pct']}%"
+          f"  top_inactive_days={metrics['top_contributor_days_inactive']}"
+          + (f"  (back-filled {backfilled} monthly snapshots)" if backfilled else ""))
 
 
 # How many of the most-recently-updated issues to fetch first-response-comment
@@ -658,7 +822,8 @@ def sync_repo(conn, owner, repo):
     if issues_needing_response_time:
         with ThreadPoolExecutor(max_workers=10) as pool:
             futures = {
-                pool.submit(fetch_first_response_at, owner, repo, issue["number"]): issue["number"]
+                pool.submit(fetch_first_response_at, owner, repo, issue["number"],
+                            (issue.get("user") or {}).get("login")): issue["number"]
                 for issue in issues_needing_response_time
             }
             for future in futures:
@@ -681,9 +846,10 @@ def sync_repo(conn, owner, repo):
 
             first_commit_at, last_commit_at = commit_week_range(entry.get("weeks", []))
 
-            contributor_id = upsert_contributor(cur, username)
+            contributor_id = upsert_contributor(cur, username, author.get("type"))
             upsert_repo_contributor(cur, repo_id, contributor_id, total_commits, additions, deletions,
                                     first_commit_at, last_commit_at)
+            upsert_contributor_weeks(cur, repo_id, contributor_id, entry.get("weeks", []))
 
         # --- weekly commit activity (for trend/backlog-style queries later) ---
         upsert_weekly_activity(cur, repo_id, commit_activity)
@@ -692,7 +858,7 @@ def sync_repo(conn, owner, repo):
         for issue in issues:
             opened_by_id = None
             if issue.get("user"):
-                opened_by_id = upsert_contributor(cur, issue["user"]["login"])
+                opened_by_id = upsert_contributor(cur, issue["user"]["login"], issue["user"].get("type"))
 
             first_response_at = first_response_map.get(issue["number"])
             upsert_issue(cur, repo_id, opened_by_id, issue, first_response_at)
@@ -701,14 +867,14 @@ def sync_repo(conn, owner, repo):
         for pr in pull_requests:
             opened_by_id = None
             if pr.get("user"):
-                opened_by_id = upsert_contributor(cur, pr["user"]["login"])
+                opened_by_id = upsert_contributor(cur, pr["user"]["login"], pr["user"].get("type"))
             upsert_pull_request(cur, repo_id, opened_by_id, pr)
 
         # --- releases ---
         for release in releases:
             published_by_id = None
             if release.get("author"):
-                published_by_id = upsert_contributor(cur, release["author"]["login"])
+                published_by_id = upsert_contributor(cur, release["author"]["login"], release["author"].get("type"))
             upsert_release(cur, repo_id, published_by_id, release)
 
         compute_and_insert_snapshot(cur, repo_id)
